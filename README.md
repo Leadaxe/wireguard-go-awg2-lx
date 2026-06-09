@@ -1,3 +1,5 @@
+**English** · [Русский](README.ru.md)
+
 # wireguard-go (lx fork) — sagernet + AmneziaWG 2.0
 
 The WireGuard-Go runtime used by **[sing-box-lx](https://github.com/Leadaxe/sing-box-lx)**:
@@ -38,7 +40,7 @@ Both `sagernet/wireguard-go` and `amneziawg-go` descend from the same upstream `
 ```
 # sing-box-lx/.gitmodules
 [submodule "submodules/wireguard-go"]
-    url = https://github.com/Leadaxe/wireguard-go
+    url = https://github.com/Leadaxe/wireguard-go-awg2-lx
     branch = lx
 
 # sing-box-lx/go.mod   (// lx)
