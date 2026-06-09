@@ -21,6 +21,13 @@ So neither fork alone works for sing-box-lx:
 | `amnezia-vpn/amneziawg-go` | ❌ | ✅ |
 | **this fork** | ✅ | ✅ |
 
+Each existing fork gives exactly **half** of what's needed:
+
+- **Take `sagernet/wireguard-go`** → sing-box-lx compiles and runs, but the AWG fields (`jc`/`h1`/`i1`…) do nothing → **no obfuscation**; AmneziaWG doesn't actually work.
+- **Take `amnezia-vpn/amneziawg-go`** → the obfuscation is there, but sing-box-lx **won't even compile** (the sagernet functions are missing).
+
+We need **both** ✅ at once, and no ready-made fork has them — so we built one by **merging**: sagernet (for the API) + amnezia (for the obfuscation). That is exactly the **"this fork"** row above.
+
 The approach: **keep the sagernet base and graft the obfuscation onto it** — rather than the reverse (adding sagernet's APIs to amneziawg-go, which would route even plain WireGuard through a foreign device). This way sing-box compiles unchanged, the obfuscation is additive and off by default, and a config without AWG fields behaves exactly like plain WireGuard.
 
 ## How the merge works
