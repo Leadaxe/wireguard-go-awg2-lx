@@ -35,7 +35,7 @@ func supportsUDPOffload(conn *net.UDPConn) (txOffload, rxOffload bool) {
 		// GOOS=="linux") is dead there — a coalesced GRO super-packet would be read
 		// as one datagram and corrupt the WG transport stream, killing download.
 		// Confirmed on device (CPH2411/Android-15: rxOffload=true, dispatch=single).
-		// TX is left untouched. See SPECS/010-B-O-WG_ENDPOINT_GRO_SPLIT_BRAIN.
+		// TX is left untouched. See SPECS/010-B-C-WG_ENDPOINT_GRO_SPLIT_BRAIN.
 		if runtime.GOOS == "android" {
 			return
 		}
