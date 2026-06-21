@@ -7,6 +7,7 @@ package conn
 
 import (
 	"net"
+	"runtime"
 
 	"golang.org/x/sys/unix"
 )
@@ -29,6 +30,15 @@ func supportsUDPOffload(conn *net.UDPConn) (txOffload, rxOffload bool) {
 			return
 		}
 		txOffload = true
+		// lx(010): never advertise RX offload on android. runtime.GOOS=="android"
+		// (not "linux"), so the GRO receive dispatcher in bind_std.go (gated on
+		// GOOS=="linux") is dead there — a coalesced GRO super-packet would be read
+		// as one datagram and corrupt the WG transport stream, killing download.
+		// Confirmed on device (CPH2411/Android-15: rxOffload=true, dispatch=single).
+		// TX is left untouched. See SPECS/010-B-O-WG_ENDPOINT_GRO_SPLIT_BRAIN.
+		if runtime.GOOS == "android" {
+			return
+		}
 		opt, errSyscall := unix.GetsockoptInt(int(fd), unix.IPPROTO_UDP, socketOptionUDPGRO)
 		if errSyscall != nil {
 			return

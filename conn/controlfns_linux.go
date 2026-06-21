@@ -60,6 +60,15 @@ func init() {
 
 		// Attempt to enable UDP_GRO
 		func(network, address string, c syscall.RawConn) error {
+			// lx(010): skip UDP_GRO on android. The GRO receive path in bind_std.go
+			// is gated on runtime.GOOS=="linux", which is false on android — so a
+			// coalesced super-packet is never split and corrupts the WG stream
+			// (download dies). Belt-and-suspenders with the rxOffload guard in
+			// features_linux.go. TX/GSO untouched.
+			// See SPECS/010-B-O-WG_ENDPOINT_GRO_SPLIT_BRAIN.
+			if runtime.GOOS == "android" {
+				return nil
+			}
 			c.Control(func(fd uintptr) {
 				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, socketOptionUDPGRO, 1)
 			})
