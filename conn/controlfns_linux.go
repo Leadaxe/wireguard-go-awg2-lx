@@ -65,7 +65,7 @@ func init() {
 			// coalesced super-packet is never split and corrupts the WG stream
 			// (download dies). Belt-and-suspenders with the rxOffload guard in
 			// features_linux.go. TX/GSO untouched.
-			// See SPECS/010-B-C-WG_ENDPOINT_GRO_SPLIT_BRAIN.
+			// See SPECS/010-WG_ENDPOINT_GRO_SPLIT_BRAIN.
 			if runtime.GOOS == "android" {
 				return nil
 			}
