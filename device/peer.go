@@ -196,6 +196,8 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 			totalLen += uint64(len(b))
 		}
 		peer.txBytes.Add(totalLen)
+	} else if errors.Is(err, conn.ErrRebindRequired) {
+		peer.device.scheduleBindUpdate()
 	}
 	return err
 }
