@@ -331,7 +331,7 @@ func TestTransportPaddingInputPacket(t *testing.T) {
 	pkt := buildIPv4Packet(testIPA, testIPB, 8)
 	dst := testIPB.AsSlice()
 
-	send := func() { pair.devA.InputPacket(dst, [][]byte{pkt}) }
+	send := func() { inputPacket(pair.devA, dst, pkt) }
 	send()
 	awaitPacket(t, pair.tunB, pkt, send)
 }

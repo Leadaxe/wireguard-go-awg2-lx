@@ -181,7 +181,7 @@ func TestAWG3EndToEnd(t *testing.T) {
 
 	// A -> B over the injection path (tightly allocated element).
 	pktInject := buildIPv4Packet(testIPA, testIPB, 8)
-	sendInject := func() { pair.devA.InputPacket(testIPB.AsSlice(), [][]byte{pktInject}) }
+	sendInject := func() { inputPacket(pair.devA, testIPB.AsSlice(), pktInject) }
 	sendInject()
 	awaitPacket(t, pair.tunB, pktInject, sendInject)
 

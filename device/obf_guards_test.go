@@ -111,8 +111,8 @@ func TestJunkSwappedBounds(t *testing.T) {
 	// Drive a packet end-to-end: the handshake (junk packets included)
 	// must complete without panicking the process.
 	pkt := buildIPv4Packet(testIPA, testIPB, 28)
-	devA.InputPacket(testIPB.AsSlice(), [][]byte{pkt})
+	inputPacket(devA, testIPB.AsSlice(), pkt)
 	awaitPacket(t, tunB, pkt, func() {
-		devA.InputPacket(testIPB.AsSlice(), [][]byte{pkt})
+		inputPacket(devA, testIPB.AsSlice(), pkt)
 	})
 }

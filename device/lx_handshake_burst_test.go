@@ -118,7 +118,7 @@ func runHandshakeBurst(t *testing.T, filter func([][]byte) [][]byte) (sent [][]b
 	}
 
 	pkt := buildIPv4Packet(testIPA, testIPB, 28)
-	devA.InputPacket(testIPB.AsSlice(), [][]byte{pkt})
+	inputPacket(devA, testIPB.AsSlice(), pkt)
 	sent = tap.wait(t)
 	mu.Lock()
 	defer mu.Unlock()
