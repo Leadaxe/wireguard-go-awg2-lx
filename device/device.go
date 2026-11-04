@@ -131,6 +131,9 @@ type Device struct {
 	// static i1..i5 CPS decoys; the caller builds a fresh set on every call
 	// (a QUIC Initial must change its DCID and ciphertext per session).
 	decoyPackets atomic.Pointer[DecoyPacketsFunc]
+	// handshakeBurst filters the masquerade burst ahead of each initiation
+	// (lx: sing-box-lx SPEC 153).
+	handshakeBurst atomic.Pointer[HandshakeBurstFunc]
 
 	// lx: AmneziaWG 3.x (sing-box-lx SPEC 080). headerProtection.key is nil
 	// when header protection is off; the pointer is swapped whole by IpcSet.
@@ -616,6 +619,25 @@ func (device *Device) SetDecoyPacketsFunc(f DecoyPacketsFunc) {
 		return
 	}
 	device.decoyPackets.Store(&f)
+}
+
+// HandshakeBurstFunc filters the masquerade burst that precedes one handshake
+// initiation: the per-handshake decoys, the static i1..i5 decoys and the Jc
+// junk datagrams, in that order, one payload per entry without transport
+// headroom. It returns the datagrams to send ahead of the initiation, in
+// order; it may keep, drop or prepend entries, and nil sends the initiation
+// alone. It is called on the handshake path and must be cheap. Without it the
+// burst goes out as assembled. lx: sing-box-lx SPEC 153.
+type HandshakeBurstFunc func(burst [][]byte) [][]byte
+
+// SetHandshakeBurstFunc installs (or, with nil, removes) the masquerade burst
+// filter. lx: sing-box-lx SPEC 153.
+func (device *Device) SetHandshakeBurstFunc(f HandshakeBurstFunc) {
+	if f == nil {
+		device.handshakeBurst.Store(nil)
+		return
+	}
+	device.handshakeBurst.Store(&f)
 }
 
 // SetPeerLookupFunc sets the function used to look up peers by public key

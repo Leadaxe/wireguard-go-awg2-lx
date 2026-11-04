@@ -228,27 +228,41 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	var sendBuffer [][]byte
 
-	// lx: AmneziaWG — per-handshake decoys (sing-box-lx SPEC 009), then the
-	// static CPS decoys (i1..i5), then Jc junk datagrams precede the initiation.
+	// lx: AmneziaWG — the masquerade burst: per-handshake decoys (sing-box-lx
+	// SPEC 009), then the static CPS decoys (i1..i5), then Jc junk datagrams
+	// precede the initiation, each its own datagram. The burst is assembled as
+	// bare payloads, offered to the HandshakeBurstFunc (sing-box-lx SPEC 153),
+	// and only then given its transport headroom.
+	var burst [][]byte
 	if f := peer.device.decoyPackets.Load(); f != nil {
 		for _, decoy := range (*f)() {
 			if len(decoy) == 0 {
 				continue
 			}
-			buf := make([]byte, MessageEncapsulatingTransportSize+len(decoy))
-			copy(buf[MessageEncapsulatingTransportSize:], decoy)
-			sendBuffer = append(sendBuffer, buf)
+			burst = append(burst, decoy)
 		}
 	}
 	for _, ipacket := range peer.device.ipackets {
 		if ipacket != nil {
-			buf := make([]byte, MessageEncapsulatingTransportSize+ipacket.ObfuscatedLen(0))
-			ipacket.Obfuscate(buf[MessageEncapsulatingTransportSize:], nil)
-			sendBuffer = append(sendBuffer, buf)
+			buf := make([]byte, ipacket.ObfuscatedLen(0))
+			ipacket.Obfuscate(buf, nil)
+			burst = append(burst, buf)
 		}
 	}
-
-	sendBuffer = append(sendBuffer, peer.device.JunkPackets()...)
+	for _, junk := range peer.device.JunkPackets() {
+		burst = append(burst, junk[MessageEncapsulatingTransportSize:])
+	}
+	if f := peer.device.handshakeBurst.Load(); f != nil {
+		burst = (*f)(burst)
+	}
+	for _, payload := range burst {
+		if len(payload) == 0 {
+			continue
+		}
+		buf := make([]byte, MessageEncapsulatingTransportSize+len(payload))
+		copy(buf[MessageEncapsulatingTransportSize:], payload)
+		sendBuffer = append(sendBuffer, buf)
+	}
 
 	// lx: AmneziaWG datagram layout: [S1 random padding][initiation][random
 	// trailer]. The padding's first 12 bytes are the header-protection nonce.
