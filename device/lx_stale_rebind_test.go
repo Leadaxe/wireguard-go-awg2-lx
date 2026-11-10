@@ -53,6 +53,43 @@ func TestNudgeRebindsStaleSession(t *testing.T) {
 	awaitPacket(t, pair.tunB, pkt, send)
 }
 
+// The wake case: an app already sent traffic, so an initiation left on the
+// dead socket moments before the nudge. The rebind voids that initiation, so
+// the re-initiation must not wait out the rekeyMinTimeout rate limit: the
+// tunnel comes up at once, not on the ~RekeyTimeout retransmit.
+func TestNudgeAfterInflightInitiationReinitiatesAtOnce(t *testing.T) {
+	pair := newGiveUpPair(t, true)
+
+	pkt := buildIPv4Packet(testIPA, testIPB, 8)
+	send := func() { pair.tunA.toDevice <- pkt }
+	start := time.Now()
+	send()
+	peer := peerOf(t, pair.devA, pair.pkB)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		peer.handshake.mutex.RLock()
+		sent := !peer.handshake.lastSentHandshake.IsZero() && time.Since(peer.handshake.lastSentHandshake) < time.Second
+		peer.handshake.mutex.RUnlock()
+		if sent {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("traffic did not trigger an initiation")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if !pair.devA.RebindIfSessionStale() {
+		t.Fatal("nudge on a cold session must rebind")
+	}
+	waitOpens(t, pair.bindA, 2)
+	send()
+	awaitPacket(t, pair.tunB, pkt, send)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("tunnel came up after %v: the re-initiation waited for the retransmit timer", elapsed.Round(10*time.Millisecond))
+	}
+}
+
 // A healthy session (live keypair, fresh handshake) must be a strict no-op.
 func TestNudgeHealthySessionNoop(t *testing.T) {
 	pair := newGiveUpPair(t, false)

@@ -136,6 +136,15 @@ func (device *Device) selfHealRebind(trigger string, peers ...*Peer) bool {
 		}
 		device.log.Verbosef("%v - Rebound socket for self-heal (trigger=%s, fresh port=%v)", peers[0], trigger, fresh)
 		for _, peer := range peers {
+			// An initiation sent shortly before the rebind left on the socket
+			// that was just closed, so its answer can never arrive; without
+			// this the rekeyMinTimeout rate limit would swallow the immediate
+			// re-initiation and the tunnel would wait for the retransmit timer
+			// (the nudge case: an app sends on wake, the nudge lands a moment
+			// later). Same back-dating as Peer.Start and ExpireCurrentKeypairs.
+			peer.handshake.mutex.Lock()
+			peer.handshake.lastSentHandshake = time.Now().Add(-(device.rekeyMinTimeout() + time.Second))
+			peer.handshake.mutex.Unlock()
 			peer.SendHandshakeInitiation(false)
 		}
 	}()
