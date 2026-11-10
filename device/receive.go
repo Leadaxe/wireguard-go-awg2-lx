@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sagernet/wireguard-go/conn"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -158,10 +159,17 @@ func (device *Device) RoutineReceiveIncoming(
 			// datagram is salted with its first 12 bytes (the S1–S4 padding);
 			// its first 8 bytes unmask the type word and the receiver index
 			// wherever they sit.
-			cip, err := device.HeaderProtectionCipher(packet)
+			// The cipher value lives on this goroutine's stack (headerCipherInto);
+			// cip stays nil when header protection is off.
+			var cipValue chacha20.Cipher
+			var cip *chacha20.Cipher
+			protected, err := device.headerCipherInto(&cipValue, packet)
 			if err != nil {
 				device.log.Errorf("Failed to initialize header cipher: %v", err)
 				continue
+			}
+			if protected {
+				cip = &cipValue
 			}
 
 			headerHash := headerHashBuf[:]
