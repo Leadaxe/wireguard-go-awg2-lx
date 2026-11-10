@@ -783,4 +783,24 @@ func (device *Device) HeaderProtectionCipher(datagram []byte) (*chacha20.Cipher,
 	return chacha20.NewUnauthenticatedCipher(key[:], datagram[:HeaderCipherNonceSize])
 }
 
+// headerCipherInto is HeaderProtectionCipher for the per-packet paths: it
+// initialises the caller's cipher value instead of returning a new one, so
+// the cipher stays on the caller's stack and no packet allocates. It reports
+// whether header protection is on; dst is left untouched when it is off.
+func (device *Device) headerCipherInto(dst *chacha20.Cipher, datagram []byte) (bool, error) {
+	key := device.headerProtection.key.Load()
+	if key == nil {
+		return false, nil
+	}
+	if len(datagram) < HeaderCipherNonceSize {
+		return false, errHeaderNonceShort
+	}
+	cip, err := chacha20.NewUnauthenticatedCipher(key[:], datagram[:HeaderCipherNonceSize])
+	if err != nil {
+		return false, err
+	}
+	*dst = *cip
+	return true, nil
+}
+
 // lx:end awg3

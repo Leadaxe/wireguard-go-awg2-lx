@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	mrand "math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/sagernet/wireguard-go/conn"
 	"github.com/sagernet/wireguard-go/tun"
+	"golang.org/x/crypto/chacha20"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -911,6 +913,19 @@ func (peer *Peer) randomTrailer(datagramSize int) int {
 	return int(fastrandn(uint32(udpWindow - datagramSize)))
 }
 
+// newPaddingRNG returns the source an encryption worker fills the S4
+// transport padding from. The padding's first 12 bytes are the AWG 3.x
+// header-protection nonce, so the source must be unpredictable and must not
+// repeat; ChaCha8 seeded from crypto/rand is a CSPRNG that gives both, without
+// the getrandom syscall per packet that crypto/rand costs on kernels without
+// the vDSO (Android before 6.11). One source per worker: ChaCha8 is not safe
+// for concurrent use.
+func newPaddingRNG() *mrand.ChaCha8 {
+	var seed [32]byte
+	rand.Read(seed[:])
+	return mrand.NewChaCha8(seed)
+}
+
 // lx:end awg3
 
 /* Encrypts the elements in the queue
@@ -920,6 +935,7 @@ func (peer *Peer) randomTrailer(datagramSize int) int {
  */
 func (device *Device) RoutineEncryption(id int) {
 	var nonce [chacha20poly1305.NonceSize]byte
+	padRNG := newPaddingRNG() // lx: AmneziaWG — per-worker S4 padding source
 
 	defer device.log.Verbosef("Routine: encryption worker %d - stopped", id)
 	device.log.Verbosef("Routine: encryption worker %d - started", id)
@@ -956,7 +972,7 @@ func (device *Device) RoutineEncryption(id int) {
 			// header-protection nonce
 			crypt := elem.buffer[MessageEncapsulatingTransportSize:headerStart]
 			if len(crypt) > 0 {
-				rand.Read(crypt)
+				padRNG.Read(crypt)
 			}
 
 			// populate header fields
@@ -1002,13 +1018,14 @@ func (device *Device) RoutineEncryption(id int) {
 			// AWG 3.x header protection: the 16-byte header is XORed with a
 			// ChaCha20 keystream keyed by the header key and salted with the
 			// padding, so type / receiver index / counter carry no structure.
-			cip, err := device.HeaderProtectionCipher(crypt)
+			var cip chacha20.Cipher // on this worker's stack, see headerCipherInto
+			protected, err := device.headerCipherInto(&cip, crypt)
 			if err != nil {
 				device.log.Errorf("%v - Header protection failed, packet dropped: %v", elem.peer, err)
 				elem.packet = nil
 				continue
 			}
-			if cip != nil {
+			if protected {
 				cip.XORKeyStream(header, header)
 			}
 		}
