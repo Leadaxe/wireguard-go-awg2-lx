@@ -17,8 +17,10 @@
  *
  * Zero cost while healthy: no timers, no goroutines — triggers 1-2 live in
  * the existing retry cycle, trigger 3 is paid by the caller. The state lives
- * in Device.giveUpRebind (device.go); enabled defaults to true in NewDevice,
- * sing-box decides freshPort from whether the user pinned listen_port.
+ * in Device.giveUpRebind (device.go). It is off by default; a consumer opts in
+ * with SetGiveUpRebind, and sing-box decides freshPort from whether the user
+ * pinned listen_port. Binds that cannot survive a Close/Open cycle (Tailscale
+ * magicsock) must stay opted out.
  */
 
 package device

@@ -86,9 +86,20 @@ type giveUpPair struct {
 	pkB        NoisePublicKey
 }
 
-// newGiveUpPair builds two Up()'d peered devices; devA sits on a gateBind
-// whose first socket generation optionally blackholes all sends.
+// newGiveUpPair builds two Up()'d peered devices with self-heal opted in on
+// devA, the way sing-box WG/AWG endpoints configure it (pinned-port variant;
+// tests that need a fresh port or a disabled mechanism override it).
 func newGiveUpPair(t *testing.T, dropFirstOpen bool) *giveUpPair {
+	t.Helper()
+	pair := newDefaultGiveUpPair(t, dropFirstOpen)
+	pair.devA.SetGiveUpRebind(true, false)
+	return pair
+}
+
+// newDefaultGiveUpPair builds two Up()'d peered devices with NewDevice
+// defaults; devA sits on a gateBind whose first socket generation optionally
+// blackholes all sends.
+func newDefaultGiveUpPair(t *testing.T, dropFirstOpen bool) *giveUpPair {
 	t.Helper()
 
 	skA, err := newPrivateKey()
