@@ -130,14 +130,17 @@ func expiredRetransmitHandshake(peer *Peer) {
 		/* lx: SPEC 041 v2 — early self-heal: >=3 unanswered initiations against
 		 * a provably dead session (no live keypair, or last handshake older
 		 * than RejectAfterTime) prove the 5-tuple dead without waiting out the
-		 * full cycle. Rebind now (debounced with the give-up trigger below);
-		 * the retry cycle itself continues untouched. */
-		peer.device.maybeEarlyGiveUpRebind(peer)
+		 * full cycle. Rebind now (debounced with the give-up trigger below).
+		 * A scheduled rebind sends this retry's initiation itself, on the new
+		 * socket; sending one here as well would race it. */
+		rebinding := peer.device.maybeEarlyGiveUpRebind(peer)
 
 		/* We clear the endpoint address src address, in case this is the cause of trouble. */
 		peer.markEndpointSrcForClearing()
 
-		peer.SendHandshakeInitiation(true)
+		if !rebinding { // lx: SPEC 041 v2
+			peer.SendHandshakeInitiation(true)
+		}
 	}
 }
 

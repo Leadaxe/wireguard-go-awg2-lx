@@ -49,18 +49,24 @@ func (device *Device) handleHandshakeGiveUp(peer *Peer) {
 // maybeEarlyGiveUpRebind is invoked from the RETRY branch of
 // expiredRetransmitHandshake. Once enough initiations went unanswered AND the
 // session is provably dead there is nothing left to protect — rebind now, at
-// ~15s instead of ~90s. The retry cycle itself continues untouched: this only
-// moves the socket under it. A live session with transient packet loss fails
+// ~15s instead of ~90s. A live session with transient packet loss fails
 // sessionProvablyDead and keeps byte-for-byte upstream behaviour; the shared
 // debounce means this also suppresses the giveup rebind of the same series.
-func (device *Device) maybeEarlyGiveUpRebind(peer *Peer) {
+//
+// Reports whether a rebind was scheduled. When it was, the rebind owns this
+// retry's initiation and the caller must not send its own: two initiations
+// leaving back to back carry the same whitened timestamp, the responder
+// answers the first and drops the second as a replay, while the initiator
+// already holds the second one's state — the answer matches nothing and the
+// tunnel waits out another retransmit.
+func (device *Device) maybeEarlyGiveUpRebind(peer *Peer) bool {
 	if peer.timers.handshakeAttempts.Load() < earlyGiveUpMinAttempts {
-		return
+		return false
 	}
 	if !device.sessionProvablyDead(peer) {
-		return
+		return false
 	}
-	device.selfHealRebind("early", peer)
+	return device.selfHealRebind("early", peer)
 }
 
 // sessionProvablyDead reports whether the peer's session is beyond saving: no
@@ -125,6 +131,7 @@ func (device *Device) selfHealRebind(trigger string, peers ...*Peer) bool {
 	}
 	fresh := device.giveUpRebind.freshPort.Load()
 	go func() {
+		started := time.Now()
 		if fresh {
 			device.net.Lock()
 			device.net.port = 0
@@ -132,6 +139,15 @@ func (device *Device) selfHealRebind(trigger string, peers ...*Peer) bool {
 		}
 		if err := device.BindUpdate(); err != nil {
 			device.log.Errorf("%v - Failed self-heal rebind (trigger=%s): %v", peers[0], trigger, err)
+			if trigger == "early" {
+				// The retry branch left its initiation to this rebind (see
+				// maybeEarlyGiveUpRebind). Send it as the retry it stands in
+				// for, so the retransmit timer is re-armed and the cycle
+				// keeps walking towards the give-up trigger.
+				for _, peer := range peers {
+					peer.SendHandshakeInitiation(true)
+				}
+			}
 			return
 		}
 		device.log.Verbosef("%v - Rebound socket for self-heal (trigger=%s, fresh port=%v)", peers[0], trigger, fresh)
@@ -142,8 +158,13 @@ func (device *Device) selfHealRebind(trigger string, peers ...*Peer) bool {
 			// re-initiation and the tunnel would wait for the retransmit timer
 			// (the nudge case: an app sends on wake, the nudge lands a moment
 			// later). Same back-dating as Peer.Start and ExpireCurrentKeypairs.
+			// An initiation stamped after the rebind began waited for it in
+			// SendBuffers and left on the new socket: it stands, and a second
+			// one on its heels would only be dropped as a replay.
 			peer.handshake.mutex.Lock()
-			peer.handshake.lastSentHandshake = time.Now().Add(-(device.rekeyMinTimeout() + time.Second))
+			if peer.handshake.lastSentHandshake.Before(started) {
+				peer.handshake.lastSentHandshake = time.Now().Add(-(device.rekeyMinTimeout() + time.Second))
+			}
 			peer.handshake.mutex.Unlock()
 			peer.SendHandshakeInitiation(false)
 		}
