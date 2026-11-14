@@ -84,6 +84,23 @@ func TestHeaderCipherIntoDoesNotAllocate(t *testing.T) {
 	}
 }
 
+// The padding carries the header-protection nonce, so every encryption worker
+// must draw it from a stream of its own: a seed shared between workers (or a
+// constant one) would repeat nonces under the same header key.
+func TestPaddingRNGsAreIndependent(t *testing.T) {
+	first, second := newPaddingRNG(), newPaddingRNG()
+	var a, b, next [32]byte
+	first.Read(a[:])
+	second.Read(b[:])
+	first.Read(next[:])
+	if a == b {
+		t.Fatal("two padding sources produced the same bytes: the seed is not per worker")
+	}
+	if a == next {
+		t.Fatal("a padding source repeated its output")
+	}
+}
+
 func BenchmarkHeaderProtectionPerPacket(b *testing.B) {
 	device := newHeaderKeyDevice(b)
 	datagram := make([]byte, 64)
