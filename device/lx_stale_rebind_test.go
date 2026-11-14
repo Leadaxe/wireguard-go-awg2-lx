@@ -53,6 +53,25 @@ func TestNudgeRebindsStaleSession(t *testing.T) {
 	awaitPacket(t, pair.tunB, pkt, send)
 }
 
+// awaitInitiationSent waits until traffic demand made the peer send its first
+// initiation, so a test that then moves the handshake clock does not race it.
+func awaitInitiationSent(t *testing.T, peer *Peer) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		peer.handshake.mutex.RLock()
+		sent := !peer.handshake.lastSentHandshake.IsZero() && time.Since(peer.handshake.lastSentHandshake) < time.Second
+		peer.handshake.mutex.RUnlock()
+		if sent {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("traffic did not trigger an initiation")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 // The wake case: an app already sent traffic, so an initiation left on the
 // dead socket moments before the nudge. The rebind voids that initiation, so
 // the re-initiation must not wait out the rekeyMinTimeout rate limit: the
@@ -65,19 +84,7 @@ func TestNudgeAfterInflightInitiationReinitiatesAtOnce(t *testing.T) {
 	start := time.Now()
 	send()
 	peer := peerOf(t, pair.devA, pair.pkB)
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		peer.handshake.mutex.RLock()
-		sent := !peer.handshake.lastSentHandshake.IsZero() && time.Since(peer.handshake.lastSentHandshake) < time.Second
-		peer.handshake.mutex.RUnlock()
-		if sent {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("traffic did not trigger an initiation")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
+	awaitInitiationSent(t, peer)
 
 	if !pair.devA.RebindIfSessionStale() {
 		t.Fatal("nudge on a cold session must rebind")
@@ -146,6 +153,71 @@ func TestNudgePinnedPortPreserved(t *testing.T) {
 	ports := pair.bindA.portsSnapshot()
 	if ports[1] != 1 {
 		t.Fatalf("nudge rebind requested port %d, want 1 (pinned)", ports[1])
+	}
+}
+
+// driveToEarlyTrigger puts the peer where ~15s of unanswered retries leave it
+// (two retries counted, the last initiation older than the retransmit
+// timeout) and fires the third retry expiry.
+func driveToEarlyTrigger(peer *Peer) {
+	peer.handshake.mutex.Lock()
+	peer.handshake.lastSentHandshake = time.Now().Add(-2 * RekeyTimeout)
+	peer.handshake.mutex.Unlock()
+	peer.timers.handshakeAttempts.Store(earlyGiveUpMinAttempts - 1)
+	expiredRetransmitHandshake(peer)
+}
+
+// The early trigger fires from the retry branch, which sends an initiation of
+// its own. Exactly one initiation must follow the rebind: two back to back
+// share a whitened timestamp, the responder drops the second as a replay
+// while the initiator holds its state, and the tunnel waits out another
+// retransmit instead of coming up at once.
+func TestEarlyRebindReinitiatesOnce(t *testing.T) {
+	pair := newGiveUpPair(t, true)
+
+	pkt := buildIPv4Packet(testIPA, testIPB, 8)
+	pair.tunA.toDevice <- pkt
+	peer := peerOf(t, pair.devA, pair.pkB)
+	awaitInitiationSent(t, peer)
+
+	start := time.Now()
+	driveToEarlyTrigger(peer)
+	awaitPacket(t, pair.tunB, pkt, func() {})
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("tunnel came up after %v: the rebind and the retry both initiated", elapsed.Round(10*time.Millisecond))
+	}
+}
+
+// A rebind that fails to reopen the socket must not swallow the retry it took
+// over: the initiation still goes out as a retry, so the retransmit timer is
+// re-armed and the attempt counter keeps walking towards the give-up trigger.
+func TestEarlyRebindFailureKeepsRetryCycle(t *testing.T) {
+	pair := newGiveUpPair(t, true)
+
+	pair.tunA.toDevice <- buildIPv4Packet(testIPA, testIPB, 8)
+	peer := peerOf(t, pair.devA, pair.pkB)
+	awaitInitiationSent(t, peer)
+
+	pair.bindA.mu.Lock()
+	pair.bindA.failOpen = true
+	pair.bindA.mu.Unlock()
+	driveToEarlyTrigger(peer)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		peer.handshake.mutex.RLock()
+		sent := time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout
+		peer.handshake.mutex.RUnlock()
+		if sent {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("failed rebind left the retry unsent: the handshake cycle stalled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := peer.timers.handshakeAttempts.Load(); got != earlyGiveUpMinAttempts {
+		t.Fatalf("handshake attempts = %d after a failed rebind, want %d (retry cycle continues)", got, earlyGiveUpMinAttempts)
 	}
 }
 
