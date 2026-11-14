@@ -160,8 +160,11 @@ type Device struct {
 	// flow entry) that otherwise pins every retry to the same dead 5-tuple
 	// until a manual reconnect. The whole mechanism — three triggers (giveup /
 	// early / nudge) sharing this state and its debounce — lives in
-	// lx_giveup_rebind.go. Enabled by default; sing-box decides freshPort
-	// from whether the user pinned listen_port.
+	// lx_giveup_rebind.go. Off by default: a consumer opts in with
+	// SetGiveUpRebind. sing-box WG/AWG endpoints do, and decide freshPort from
+	// whether the user pinned listen_port. The Tailscale engine must not: its
+	// magicsock bind closes its sockets on Close and does not reopen them on
+	// Open, so a rebind silently stops all direct UDP receive.
 	giveUpRebind struct {
 		enabled   atomic.Bool
 		freshPort atomic.Bool
@@ -371,7 +374,6 @@ func (device *Device) SetPrivateKey(sk NoisePrivateKey) error {
 func NewDevice(ctx context.Context, tunDevice tun.Device, bind conn.Bind, logger *Logger, workers int) *Device {
 	device := new(Device)
 	device.pauseManager = service.FromContext[pause.Manager](ctx)
-	device.giveUpRebind.enabled.Store(true) // lx: SPEC 041 — self-heal on by default
 	device.state.state.Store(uint32(deviceStateDown))
 	device.closed = make(chan struct{})
 	device.log = logger

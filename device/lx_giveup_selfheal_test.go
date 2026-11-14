@@ -28,6 +28,7 @@ package device
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -45,10 +46,17 @@ type gateBind struct {
 	mu        sync.Mutex
 	openPorts []uint16
 	opens     int
-	dropOpens int // swallow sends while opens <= dropOpens
+	dropOpens int  // swallow sends while opens <= dropOpens
+	failOpen  bool // the next Open fails: a rebind that cannot reopen the socket
 }
 
 func (b *gateBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
+	b.mu.Lock()
+	fail := b.failOpen
+	b.mu.Unlock()
+	if fail {
+		return nil, 0, errors.New("gateBind: open refused")
+	}
 	fns, actual, err := b.chanBind.Open(port)
 	b.mu.Lock()
 	b.opens++
@@ -86,9 +94,20 @@ type giveUpPair struct {
 	pkB        NoisePublicKey
 }
 
-// newGiveUpPair builds two Up()'d peered devices; devA sits on a gateBind
-// whose first socket generation optionally blackholes all sends.
+// newGiveUpPair builds two Up()'d peered devices with self-heal opted in on
+// devA, the way sing-box WG/AWG endpoints configure it (pinned-port variant;
+// tests that need a fresh port or a disabled mechanism override it).
 func newGiveUpPair(t *testing.T, dropFirstOpen bool) *giveUpPair {
+	t.Helper()
+	pair := newDefaultGiveUpPair(t, dropFirstOpen)
+	pair.devA.SetGiveUpRebind(true, false)
+	return pair
+}
+
+// newDefaultGiveUpPair builds two Up()'d peered devices with NewDevice
+// defaults; devA sits on a gateBind whose first socket generation optionally
+// blackholes all sends.
+func newDefaultGiveUpPair(t *testing.T, dropFirstOpen bool) *giveUpPair {
 	t.Helper()
 
 	skA, err := newPrivateKey()
