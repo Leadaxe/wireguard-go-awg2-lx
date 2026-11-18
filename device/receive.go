@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/wireguard-go/conn"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
@@ -26,7 +27,7 @@ type QueueHandshakeElement struct {
 }
 
 type QueueInboundElement struct {
-	buffer   *[MaxMessageSize]byte
+	buffer   []byte
 	packet   []byte
 	counter  uint64
 	keypair  *Keypair
@@ -140,8 +141,13 @@ func (device *Device) RoutineReceiveIncoming(
 			// get message padding and type based on information from S1-S4 and H1-H4
 			msgType, padding := device.DeterminePacketTypeAndPadding(packet, MessageUnknownType)
 			if padding > 0 {
-				copy(packet, packet[padding:])
-				packet = packet[:len(packet)-padding]
+				if msgType == MessageTransportType && !device.pool.fullInboundBuffers {
+					// The queued copy will remove the prefix without shifting the read slot.
+					packet = packet[padding:]
+				} else {
+					copy(packet, packet[padding:])
+					packet = packet[:len(packet)-padding]
+				}
 			}
 
 			switch msgType {
@@ -176,8 +182,17 @@ func (device *Device) RoutineReceiveIncoming(
 				// create work element
 				peer := value.peer
 				elem := device.GetInboundElement()
-				elem.packet = packet
-				elem.buffer = bufsArrs[i]
+				if device.pool.fullInboundBuffers {
+					// Preserve device pool accounting or batched TUN merge capacity.
+					elem.buffer = bufsArrs[i][:]
+					elem.packet = packet
+					bufsArrs[i] = device.GetMessageBuffer()
+					bufs[i] = bufsArrs[i][:]
+				} else {
+					elem.buffer = buf.Get(len(packet))
+					copy(elem.buffer, packet)
+					elem.packet = elem.buffer
+				}
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
 				elem.counter = 0
@@ -189,8 +204,6 @@ func (device *Device) RoutineReceiveIncoming(
 					elemsByPeer[peer] = elemsForPeer
 				}
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
 				continue
 
 			// otherwise it is a fixed size & handshake related packet
@@ -233,7 +246,6 @@ func (device *Device) RoutineReceiveIncoming(
 				device.queue.decryption.c <- elemsContainer
 			} else {
 				for _, elem := range elemsContainer.elems {
-					device.PutMessageBuffer(elem.buffer)
 					device.PutInboundElement(elem)
 				}
 				device.PutInboundElementsContainer(elemsContainer)
@@ -560,7 +572,6 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			}
 		}
 		for _, elem := range elemsContainer.elems {
-			device.PutMessageBuffer(elem.buffer)
 			device.PutInboundElement(elem)
 		}
 		bufs = bufs[:0]
