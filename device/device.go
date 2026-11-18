@@ -71,6 +71,7 @@ type Device struct {
 	cookieChecker CookieChecker
 
 	pool struct {
+		fullInboundBuffers        bool // immutable receive allocation and TUN write policy
 		inboundElementsContainer  *WaitPool
 		outboundElementsContainer *WaitPool
 		messageBuffers            *WaitPool

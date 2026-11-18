@@ -7,6 +7,9 @@ package device
 
 import (
 	"sync"
+
+	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/wireguard-go/tun"
 )
 
 type WaitPool struct {
@@ -58,6 +61,10 @@ func (device *Device) PopulatePools() {
 	device.pool.messageBuffers = NewWaitPool(PreallocatedBuffersPerPool, func() any {
 		return new([MaxMessageSize]byte)
 	})
+	// A batched TUN may merge packets in place using the first buffer's capacity.
+	_, gro := device.tun.device.(tun.GRODevice)
+	device.pool.fullInboundBuffers = device.pool.messageBuffers.max != 0 ||
+		gro || (device.tun.device != nil && device.tun.device.BatchSize() > 1)
 	device.pool.inboundElements = NewWaitPool(PreallocatedBuffersPerPool, func() any {
 		return new(QueueInboundElement)
 	})
@@ -107,6 +114,11 @@ func (device *Device) GetInboundElement() *QueueInboundElement {
 }
 
 func (device *Device) PutInboundElement(elem *QueueInboundElement) {
+	if device.pool.fullInboundBuffers {
+		device.PutMessageBuffer((*[MaxMessageSize]byte)(elem.buffer))
+	} else {
+		_ = buf.Put(elem.buffer)
+	}
 	elem.clearPointers()
 	device.pool.inboundElements.Put(elem)
 }
