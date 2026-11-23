@@ -1,0 +1,40 @@
+//go:build !linux
+
+/* SPDX-License-Identifier: MIT
+ *
+ * lx: SPEC 160 — see lx_connect_linux.go. On macOS the bind connects in
+ * single-peer mode by itself (msgx_darwin.go); elsewhere it never does.
+ */
+
+package conn
+
+import (
+	"net"
+	"net/netip"
+
+	"golang.org/x/net/ipv6"
+)
+
+type connectState struct{}
+
+func (c *connectState) reset() {}
+
+// SetConnectedSocket is a no-op on this platform.
+func (s *StdNetBind) SetConnectedSocket() {}
+
+// ConnectedPeer always returns the zero value on this platform.
+func (s *StdNetBind) ConnectedPeer(is6 bool) netip.AddrPort {
+	return netip.AddrPort{}
+}
+
+func (s *StdNetBind) pinPort(port int) int {
+	return port
+}
+
+func (s *StdNetBind) connectedReceive(receiveFuncs []ReceiveFunc, v4conn, v6conn *net.UDPConn, port int) []ReceiveFunc {
+	return receiveFuncs
+}
+
+func (s *StdNetBind) sendConnected(conn *net.UDPConn, writer batchWriter, is6, offload bool, bufs [][]byte, endpoint *StdNetEndpoint, offset int, msgs []ipv6.Message) (bool, error) {
+	return false, nil
+}

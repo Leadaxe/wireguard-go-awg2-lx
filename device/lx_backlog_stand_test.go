@@ -59,9 +59,14 @@ func standEnvInt(name string, def int) int {
 func standUDP() bool { return os.Getenv("LX_STAND_BIND") == "udp" }
 
 // standUDPBind is a socket bind for the stand. LX_STAND_READ_COUNT sets how
-// many datagrams one read takes (sing-box-lx SPEC 158 part 2).
+// many datagrams one read takes (sing-box-lx SPEC 158 part 2);
+// LX_STAND_CONNECT=1 lets it connect its sockets to the peer (SPEC 160).
 func standUDPBind(tb testing.TB) conn.Bind {
 	bind := conn.NewStdNetBind(nil).(*conn.StdNetBind)
+	if os.Getenv("LX_STAND_CONNECT") == "1" {
+		bind.SetSinglePeerMode()
+		bind.SetConnectedSocket()
+	}
 	if count := standEnvInt("LX_STAND_READ_COUNT", 0); count > 0 {
 		if err := bind.SetReadDatagramCount(count); err != nil {
 			tb.Fatal(err)
@@ -139,9 +144,18 @@ func (t *standSinkTun) Write(bufs [][]byte, offset int) (int, error) {
 // datagrams.
 type standBind struct {
 	conn.Bind
-	gate     sync.RWMutex
-	sent     atomic.Int64
-	received atomic.Int64
+	gate       sync.RWMutex
+	sent       atomic.Int64
+	received   atomic.Int64
+	pathResets atomic.Int64
+}
+
+// ResetPath keeps the wrapped bind reachable as a conn.PathResetter.
+func (b *standBind) ResetPath() {
+	b.pathResets.Add(1)
+	if resetter, ok := b.Bind.(conn.PathResetter); ok {
+		resetter.ResetPath()
+	}
 }
 
 func (b *standBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
