@@ -453,8 +453,12 @@ func (device *Device) RoutineReadFromTUN() {
 		sizes       = make([]int, batchSize)
 	)
 
+	// lx: a queued packet must not pin a MaxMessageSize buffer, so read buffers
+	// are sized for the MTU when the TUN reads one packet at a time
+	// (lx_packet_sized.go)
+	readSize := device.tunReadSize(device.paddings.transport.Load())
 	for i := range elems {
-		elems[i] = device.NewOutboundElement()
+		elems[i] = device.newTunReadElement(readSize)
 		bufs[i] = elems[i].buffer[:]
 	}
 
@@ -472,11 +476,20 @@ func (device *Device) RoutineReadFromTUN() {
 		// header, so RoutineEncryption can build the whole datagram in place.
 		padding := device.paddings.transport.Load()
 		offset := MessageEncapsulatingTransportSize + int(padding) + MessageTransportHeaderSize
+		// lx: the MTU or the padding may have grown past what the buffers were
+		// sized for
+		if need := device.tunReadSize(padding); need > readSize {
+			readSize = need
+			device.resizeTunRead(elems, bufs, readSize)
+		}
 
 		// read packets
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
+				continue
+			}
+			if device.tunReadOverran(offset+sizes[i], readSize, padding) { // lx: may be cut short
 				continue
 			}
 
@@ -517,7 +530,7 @@ func (device *Device) RoutineReadFromTUN() {
 				elemsByPeer[peer] = elemsForPeer
 			}
 			elemsForPeer.elems = append(elemsForPeer.elems, elem)
-			elems[i] = device.NewOutboundElement()
+			elems[i] = device.newTunReadElement(readSize) // lx
 			bufs[i] = elems[i].buffer[:]
 		}
 
@@ -953,9 +966,9 @@ func (device *Device) RoutineEncryption(id int) {
 			headerStart := MessageEncapsulatingTransportSize + padding
 			offset := headerStart + MessageTransportHeaderSize
 			if int(elem.padding) != padding || (len(elem.packet) > 0 && &elem.packet[0] != &elem.buffer[offset]) {
-				if offset+len(elem.packet)+chacha20poly1305.Overhead > len(elem.buffer) {
-					// an injected element allocated for a smaller s4 (reconfigured
-					// while in flight) — nothing sensible fits, drop it
+				if offset+len(elem.packet)+chacha20poly1305.Overhead > len(elem.buffer) && !device.regrowOutbound(elem, offset) {
+					// an element allocated for a smaller s4 (reconfigured while
+					// in flight) that fits no datagram under the current one
 					device.log.Verbosef("%v - Packet dropped: no room to relocate under transport padding %d", elem.peer, padding)
 					elem.packet = nil
 					continue
