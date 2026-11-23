@@ -331,6 +331,9 @@ func (s *StdNetBind) SetIOActivityFuncs(onRead func(size int), onWrite func(size
 
 func (s *StdNetBind) putMessages(msgs *[]ipv6.Message) {
 	for i := range *msgs {
+		if messageUntouched(&(*msgs)[i]) { // lx: SPEC 160 — upstream resets all of them; see lx_messages.go
+			break
+		}
 		buffers := (*msgs)[i].Buffers
 		for j := range buffers {
 			buffers[j] = nil
@@ -382,7 +385,9 @@ func (s *StdNetBind) receiveIP(
 				return 0, err
 			}
 		} else {
-			numMsgs, err = br.ReadBatch(*msgs, 0)
+			// lx: SPEC 160 — upstream reads into *msgs. Only these got a
+			// buffer above; a datagram read into another would be lost.
+			numMsgs, err = br.ReadBatch((*msgs)[:len(bufs)], 0)
 			if err != nil {
 				return 0, err
 			}
@@ -569,7 +574,7 @@ retry:
 	} else {
 		for i := range bufs {
 			(*msgs)[i].Addr = ua
-			(*msgs)[i].Buffers[0] = bufs[i][offset:]
+			setMessageBuffer(&(*msgs)[i], bufs[i][offset:]) // lx: SPEC 160 — upstream assigns Buffers[0]
 			setSrcControl(&(*msgs)[i].OOB, standardEndpoint)
 		}
 		err = s.send(conn, br, (*msgs)[:len(bufs)])
