@@ -357,7 +357,7 @@ func TestTransportPaddingInputPackets(t *testing.T) {
 }
 
 // TestTransportPaddingTunPath covers the regular outbound path (tun read
-// loop), whose MaxMessageSize buffers take the in-place shift branch.
+// loop), whose buffers take the in-place shift branch.
 func TestTransportPaddingTunPath(t *testing.T) {
 	pair := newPaddedDevicePair(t)
 

@@ -86,6 +86,10 @@ type Device struct {
 		outboundElements          *sync.Pool
 	}
 
+	// lx: a queued transport packet holds a buffer of its own size, not a
+	// MaxMessageSize one (lx_packet_sized.go)
+	sizing packetSizing
+
 	queue struct {
 		encryption *outboundQueue
 		decryption *inboundQueue
