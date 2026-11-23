@@ -197,6 +197,7 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	}
 	if peer.endpoint.clearSrcOnTx {
 		endpoint.ClearSrc()
+		peer.device.resetBindPath() // lx: SPEC 160
 		peer.endpoint.clearSrcOnTx = false
 	}
 	peer.endpoint.Unlock()
@@ -485,6 +486,7 @@ func (peer *Peer) sendHandshakeBuffers(buffers [][]byte, candidates []conn.Endpo
 	current := peer.endpoint.val
 	if current != nil && peer.endpoint.clearSrcOnTx {
 		current.ClearSrc()
+		peer.device.resetBindPath() // lx: SPEC 160
 		peer.endpoint.clearSrcOnTx = false
 	}
 	peer.endpoint.Unlock()

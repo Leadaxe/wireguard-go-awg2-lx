@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/sagernet/sing/common"
@@ -61,6 +62,9 @@ type StdNetBind struct {
 	msgsPool    sync.Pool
 
 	msgx msgXState
+
+	readDatagrams atomic.Int32 // lx: SPEC 158 part 2 — see lx_read_count.go; not guarded by mu
+	connect       connectState // lx: SPEC 160 — see lx_connect_linux.go; has its own lock
 
 	blackhole4 bool
 	blackhole6 bool
@@ -190,11 +194,12 @@ func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 		return nil, 0, ErrBindAlreadyOpen
 	}
 	s.msgx.reset()
+	s.connect.reset() // lx: SPEC 160
 
 	// Attempt to open ipv4 and ipv6 listeners on the same port.
 	// If uport is 0, we can retry on failure.
 again:
-	port := int(uport)
+	port := s.pinPort(int(uport)) // lx: SPEC 160 — upstream: int(uport)
 	var v4conn, v6conn *net.UDPConn
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
@@ -207,14 +212,19 @@ again:
 	// that error used to close the already-open v4 socket — with BindUpdate
 	// having closed the old bind first, the device was left with no sockets
 	// at all. See bindFamilyUnavailable in lx_family_{default,windows}.go.
-	v4conn, port, err = listenNet(s.externalControl, "udp4", port)
+	v4conn, port, err = listenNet(s.listenControl(), "udp4", port) // lx: SPEC 158 part 2 — upstream passes s.externalControl
+	// lx: SPEC 160 — a port picked by pinPort may have been taken meanwhile
+	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
+		tries++
+		goto again
+	}
 	if err != nil && !bindFamilyUnavailable(err) {
 		return nil, 0, err
 	}
 	v4port := port // lx: SPEC 069 — survives the clobber below
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet(s.externalControl, "udp6", port)
+	v6conn, port, err = listenNet(s.listenControl(), "udp6", port) // lx: SPEC 158 part 2 — as above
 	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
 		if v4conn != nil { // lx: SPEC 069 — v4 may have degraded away above
 			v4conn.Close()
@@ -287,6 +297,7 @@ again:
 	if len(fns) == 0 {
 		return nil, 0, syscall.EAFNOSUPPORT
 	}
+	fns = s.connectedReceive(fns, v4conn, v6conn, port) // lx: SPEC 160
 	if s.egressProvider != nil {
 		s.egressProvider.SetEgressPort(uint16(port))
 		fns = append(fns, func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
@@ -331,6 +342,9 @@ func (s *StdNetBind) SetIOActivityFuncs(onRead func(size int), onWrite func(size
 
 func (s *StdNetBind) putMessages(msgs *[]ipv6.Message) {
 	for i := range *msgs {
+		if messageUntouched(&(*msgs)[i]) { // lx: SPEC 160 — upstream resets all of them; see lx_messages.go
+			break
+		}
 		buffers := (*msgs)[i].Buffers
 		for j := range buffers {
 			buffers[j] = nil
@@ -382,7 +396,9 @@ func (s *StdNetBind) receiveIP(
 				return 0, err
 			}
 		} else {
-			numMsgs, err = br.ReadBatch(*msgs, 0)
+			// lx: SPEC 160 — upstream reads into *msgs. Only these got a
+			// buffer above; a datagram read into another would be lost.
+			numMsgs, err = br.ReadBatch((*msgs)[:len(bufs)], 0)
 			if err != nil {
 				return 0, err
 			}
@@ -427,7 +443,7 @@ func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxO
 // rename the IdealBatchSize constant to BatchSize.
 func (s *StdNetBind) BatchSize() int {
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		return IdealBatchSize
+		return s.readBatchSize() // lx: SPEC 158 part 2 — IdealBatchSize unless configured
 	}
 	if supportsMsgX {
 		return msgXBatchSize
@@ -550,6 +566,10 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint, offset int) error {
 			return nil
 		}
 	}
+	// lx: SPEC 160 — a connected socket takes the datagrams as they are
+	if handled, err := s.sendConnected(conn, br, is6, offload, bufs, standardEndpoint, offset, *msgs); handled {
+		return err
+	}
 retry:
 	if offload {
 		n := coalesceMessages(ua, standardEndpoint, bufs, offset, *msgs, setGSOSize)
@@ -569,7 +589,7 @@ retry:
 	} else {
 		for i := range bufs {
 			(*msgs)[i].Addr = ua
-			(*msgs)[i].Buffers[0] = bufs[i][offset:]
+			setMessageBuffer(&(*msgs)[i], bufs[i][offset:]) // lx: SPEC 160 — upstream assigns Buffers[0]
 			setSrcControl(&(*msgs)[i].OOB, standardEndpoint)
 		}
 		err = s.send(conn, br, (*msgs)[:len(bufs)])

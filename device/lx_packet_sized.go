@@ -167,6 +167,18 @@ func (device *Device) outboundBufferSize(end int) int {
 	return min(end+chacha20poly1305.Overhead+device.outboundTailroom(end), MaxMessageSize)
 }
 
+// DisablePacketSizedTunReads makes the TUN read loop take full-size buffers,
+// as upstream does. It is a diagnostic switch (sing-box-lx
+// lx.wg.buffers.send_by_mtu): it takes sized read buffers out of the picture
+// without rebuilding. The loop checks the size before every read, so the
+// change applies from the next packet; there is no way back, as there is none
+// after the TUN broke its MTU.
+//
+// Inbound messages keep their compact buffers either way.
+func (device *Device) DisablePacketSizedTunReads() {
+	device.sizing.tunRead.Store(false)
+}
+
 // tunReadSize is the buffer a TUN read needs under transport padding
 // `padding`: room for one MTU-sized packet, or MaxMessageSize when the TUN
 // may return more than that. The padding is the caller's, not the device's

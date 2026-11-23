@@ -18,6 +18,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sagernet/wireguard-go/conn"
 )
 
 func poolCount(p *WaitPool) uint32 {
@@ -452,5 +454,102 @@ func TestTunReadStaleMTU(t *testing.T) {
 	}
 	if got := dev.tunReadSize(0); got <= stale {
 		t.Fatalf("read buffer for MTU 1800 is %d, not above %d", got, stale)
+	}
+}
+
+// TestDisablePacketSizedTunReads: the diagnostic switch puts the TUN read
+// loop back on full-size buffers, and packets keep crossing.
+func TestDisablePacketSizedTunReads(t *testing.T) {
+	if standUDP() {
+		t.Skip("needs the lossless in-memory bind")
+	}
+	s := newStand(t, 60, 1380, 1, nil)
+	if got := s.devA.tunReadSize(60); got >= MaxMessageSize {
+		t.Fatalf("read buffer is %d bytes before the switch", got)
+	}
+	s.devA.DisablePacketSizedTunReads()
+	if got := s.devA.tunReadSize(60); got != MaxMessageSize {
+		t.Fatalf("read buffer is %d bytes after the switch, want %d", got, MaxMessageSize)
+	}
+	r := s.runTxBacklog(t)
+	t.Log(r)
+	if r.sent == 0 || r.lost != 0 {
+		t.Fatalf("sent %d, lost %d", r.sent, r.lost)
+	}
+	if r.queued > 0 && r.retained/uint64(r.queued) < MaxMessageSize/2 {
+		t.Fatalf("a queued packet holds %d bytes: the read loop is still on sized buffers", r.retained/uint64(r.queued))
+	}
+}
+
+// TestSmallReadCountBatchingTun: the socket reads eight datagrams at a time
+// while the TUN moves 128 packets at a time, so the device's batch size is
+// larger than the bind's. Everything sized by one of the two must hold.
+func TestSmallReadCountBatchingTun(t *testing.T) {
+	if testing.Short() {
+		t.Skip("floods the pipeline until it stalls")
+	}
+	t.Setenv("LX_STAND_BIND", "udp")
+	t.Setenv("LX_STAND_READ_COUNT", "8")
+	s := newStand(t, 60, 1380, 128, nil)
+	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
+		if got := s.bindB.Bind.BatchSize(); got != 8 {
+			t.Fatalf("bind batch size is %d", got)
+		}
+		if got := s.devB.BatchSize(); got != 128 {
+			t.Fatalf("device batch size is %d", got)
+		}
+	}
+	r := s.runRxBacklog(t, nil)
+	t.Log(r)
+	if delivered := r.sent - r.lost; delivered < 1000 {
+		t.Fatalf("only %d packets crossed", delivered)
+	}
+}
+
+// TestClearSrcResetsBindPath: where the device gives up on an endpoint's
+// sticky source it also tells the bind, which may hold a connected socket.
+func TestClearSrcResetsBindPath(t *testing.T) {
+	if standUDP() {
+		t.Skip("needs the lossless in-memory bind")
+	}
+	s := newStand(t, 0, 1380, 1, nil)
+	before := s.bindA.pathResets.Load()
+	s.peerOnA.markEndpointSrcForClearing()
+	s.inject(s.packet(0))
+	deadline := time.Now().Add(5 * time.Second)
+	for s.bindA.pathResets.Load() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("the bind was not told to reset its path")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.bindA.pathResets.Load() - before; got != 1 {
+		t.Fatalf("the bind was told %d times for one cleared source", got)
+	}
+}
+
+// TestConnectedSocketTunnel runs the tunnel over sockets connected to the
+// peer on both ends.
+func TestConnectedSocketTunnel(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+		t.Skip("the bind connects only on Linux")
+	}
+	if testing.Short() {
+		t.Skip("floods the pipeline until it stalls")
+	}
+	t.Setenv("LX_STAND_BIND", "udp")
+	t.Setenv("LX_STAND_CONNECT", "1")
+	for _, s4 := range []int{0, 60} {
+		s := newStand(t, s4, 1380, 1, nil)
+		r := s.runRxBacklog(t, nil)
+		t.Log(r)
+		if delivered := r.sent - r.lost; delivered < 1000 {
+			t.Fatalf("s4=%d: only %d packets crossed", s4, delivered)
+		}
+		for name, bind := range map[string]*standBind{"A": s.bindA, "B": s.bindB} {
+			if !bind.Bind.(*conn.StdNetBind).ConnectedPeer(false).IsValid() {
+				t.Fatalf("s4=%d: the socket of %s is not connected", s4, name)
+			}
+		}
 	}
 }
