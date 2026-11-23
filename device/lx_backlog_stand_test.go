@@ -58,6 +58,18 @@ func standEnvInt(name string, def int) int {
 
 func standUDP() bool { return os.Getenv("LX_STAND_BIND") == "udp" }
 
+// standUDPBind is a socket bind for the stand. LX_STAND_READ_COUNT sets how
+// many datagrams one read takes (sing-box-lx SPEC 158 part 2).
+func standUDPBind(tb testing.TB) conn.Bind {
+	bind := conn.NewStdNetBind(nil).(*conn.StdNetBind)
+	if count := standEnvInt("LX_STAND_READ_COUNT", 0); count > 0 {
+		if err := bind.SetReadDatagramCount(count); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	return bind
+}
+
 // standSinkTun is B's TUN. It can be held shut: Write then blocks, so
 // everything B has accepted stays queued inside it.
 type standSinkTun struct {
@@ -198,8 +210,8 @@ func newStand(tb testing.TB, s4, payloadLen, tunBatch int, prepare func(devB *De
 	s.tunB.minCap.Store(1 << 62)
 	portA, portB := 1, 2
 	if standUDP() {
-		s.bindA = &standBind{Bind: conn.NewStdNetBind(nil)}
-		s.bindB = &standBind{Bind: conn.NewStdNetBind(nil)}
+		s.bindA = &standBind{Bind: standUDPBind(tb)}
+		s.bindB = &standBind{Bind: standUDPBind(tb)}
 		portA, portB = standFreePort(tb), standFreePort(tb)
 	} else {
 		a, b := newChanBindPair()
