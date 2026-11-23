@@ -84,6 +84,11 @@ type Device struct {
 		messageBuffers            *WaitPool
 		inboundElements           *sync.Pool
 		outboundElements          *sync.Pool
+		// lx: packet-sized buffers for queued inbound transport packets, and
+		// whether this device queues them (lx_inbound_compact.go)
+		inboundCompact *WaitPool
+		compactInbound bool
+		inboundSlots   atomic.Int32 // read slots travelling with queued packets
 	}
 
 	queue struct {

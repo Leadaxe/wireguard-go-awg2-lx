@@ -90,7 +90,8 @@ func newAutodrainingInboundQueue(device *Device) *autodrainingInboundQueue {
 }
 
 func (device *Device) needsInboundQueueFinalizer() bool {
-	return device.pool.messageBuffers.hasAccounting()
+	// lx: the slot budget is accounting too, with or without bounded pools
+	return device.pool.messageBuffers.hasAccounting() || device.pool.compactInbound
 }
 
 func (device *Device) flushInboundQueue(c <-chan *QueueInboundElementsContainer) {

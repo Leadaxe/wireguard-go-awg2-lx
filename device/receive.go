@@ -29,13 +29,17 @@ type QueueHandshakeElement struct {
 }
 
 type QueueInboundElement struct {
-	buffer   *[MaxMessageSize]byte
+	buffer *[MaxMessageSize]byte
+	// lx: a packet-sized copy of the message, when the read slot stayed with
+	// the receive routine; then buffer is nil (see lx_inbound_compact.go).
+	compact  *[inboundCompactSize]byte
 	packet   []byte
 	counter  uint64
 	keypair  *Keypair
 	endpoint conn.Endpoint
 	// lx: AmneziaWG — the transport padding (s4) this datagram arrived with;
-	// packet is buffer[padding:...], the padding is left in place.
+	// packet is buffer[padding:...], the padding is left in place. A compact
+	// copy leaves the padding behind, but the wire size still counts it.
 	padding uint32
 }
 
@@ -55,6 +59,7 @@ type QueueInboundElementsContainer struct {
 // It also reduces the possible collateral damage from use-after-free bugs.
 func (elem *QueueInboundElement) clearPointers() {
 	elem.buffer = nil
+	elem.compact = nil
 	elem.packet = nil
 	elem.keypair = nil
 	elem.endpoint = nil
@@ -247,8 +252,9 @@ func (device *Device) RoutineReceiveIncoming(
 				// create work element
 				peer := value.peer
 				elem := device.GetInboundElement()
-				elem.packet = packet
-				elem.buffer = bufsArrs[i]
+				// lx: past the slot budget the message is queued in a
+				// packet-sized buffer and the read slot stays here.
+				tookSlot := device.stageInbound(elem, bufsArrs[i], packet)
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
 				elem.counter = 0
@@ -260,8 +266,10 @@ func (device *Device) RoutineReceiveIncoming(
 					elemsByPeer[peer] = elemsForPeer
 				}
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
+				if tookSlot {
+					bufsArrs[i] = device.GetMessageBuffer()
+					bufs[i] = bufsArrs[i][:]
+				}
 				continue
 
 			// otherwise it is a fixed size & handshake related packet
@@ -647,9 +655,9 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
 			continue
 		}
 
-		// the plaintext sits behind the (untouched) padding and the header
-		start := int(elem.padding)
-		scratch = append(scratch, elem.buffer[start:start+MessageTransportOffsetContent+len(elem.packet)])
+		// the plaintext sits behind the header (and, in a read slot, the
+		// untouched padding)
+		scratch = append(scratch, elem.tunFrame())
 	}
 
 	peer.rxBytes.Add(rxBytesLen)
