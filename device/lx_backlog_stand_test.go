@@ -255,7 +255,7 @@ func (s *stand) inFlight() int64 {
 // inject hands pkt to A the way a userspace network stack does, in a
 // packet-sized buffer. The caller keeps the window.
 func (s *stand) inject(pkt []byte) {
-	s.devA.InputPacket(s.dst, [][]byte{pkt})
+	inputPacket(s.devA, s.dst, pkt)
 }
 
 // warmUp sends sequence-0 packets until one crosses, so the handshake is done
