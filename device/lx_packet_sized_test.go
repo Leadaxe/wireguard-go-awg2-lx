@@ -18,6 +18,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sagernet/wireguard-go/conn"
 )
 
 func poolCount(p *WaitPool) uint32 {
@@ -501,5 +503,53 @@ func TestSmallReadCountBatchingTun(t *testing.T) {
 	t.Log(r)
 	if delivered := r.sent - r.lost; delivered < 1000 {
 		t.Fatalf("only %d packets crossed", delivered)
+	}
+}
+
+// TestClearSrcResetsBindPath: where the device gives up on an endpoint's
+// sticky source it also tells the bind, which may hold a connected socket.
+func TestClearSrcResetsBindPath(t *testing.T) {
+	if standUDP() {
+		t.Skip("needs the lossless in-memory bind")
+	}
+	s := newStand(t, 0, 1380, 1, nil)
+	before := s.bindA.pathResets.Load()
+	s.peerOnA.markEndpointSrcForClearing()
+	s.inject(s.packet(0))
+	deadline := time.Now().Add(5 * time.Second)
+	for s.bindA.pathResets.Load() == before {
+		if time.Now().After(deadline) {
+			t.Fatal("the bind was not told to reset its path")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := s.bindA.pathResets.Load() - before; got != 1 {
+		t.Fatalf("the bind was told %d times for one cleared source", got)
+	}
+}
+
+// TestConnectedSocketTunnel runs the tunnel over sockets connected to the
+// peer on both ends.
+func TestConnectedSocketTunnel(t *testing.T) {
+	if runtime.GOOS != "linux" && runtime.GOOS != "android" {
+		t.Skip("the bind connects only on Linux")
+	}
+	if testing.Short() {
+		t.Skip("floods the pipeline until it stalls")
+	}
+	t.Setenv("LX_STAND_BIND", "udp")
+	t.Setenv("LX_STAND_CONNECT", "1")
+	for _, s4 := range []int{0, 60} {
+		s := newStand(t, s4, 1380, 1, nil)
+		r := s.runRxBacklog(t, nil)
+		t.Log(r)
+		if delivered := r.sent - r.lost; delivered < 1000 {
+			t.Fatalf("s4=%d: only %d packets crossed", s4, delivered)
+		}
+		for name, bind := range map[string]*standBind{"A": s.bindA, "B": s.bindB} {
+			if !bind.Bind.(*conn.StdNetBind).ConnectedPeer(false).IsValid() {
+				t.Fatalf("s4=%d: the socket of %s is not connected", s4, name)
+			}
+		}
 	}
 }
