@@ -29,7 +29,10 @@ type QueueHandshakeElement struct {
 }
 
 type QueueInboundElement struct {
-	buffer   *[MaxMessageSize]byte
+	buffer *[MaxMessageSize]byte
+	// lx: the compact buffer the message was copied into, when the read slot
+	// stayed with the receive routine; then buffer is nil (lx_packet_sized.go).
+	compact  *[compactSize]byte
 	packet   []byte
 	counter  uint64
 	keypair  *Keypair
@@ -55,6 +58,7 @@ type QueueInboundElementsContainer struct {
 // It also reduces the possible collateral damage from use-after-free bugs.
 func (elem *QueueInboundElement) clearPointers() {
 	elem.buffer = nil
+	elem.compact = nil
 	elem.packet = nil
 	elem.keypair = nil
 	elem.endpoint = nil
@@ -247,8 +251,9 @@ func (device *Device) RoutineReceiveIncoming(
 				// create work element
 				peer := value.peer
 				elem := device.GetInboundElement()
-				elem.packet = packet
-				elem.buffer = bufsArrs[i]
+				// lx: a queued message must not pin a whole read slot, so one
+				// that fits a compact buffer is copied and the slot stays here.
+				tookSlot := device.stageInbound(elem, bufsArrs[i], packet)
 				elem.keypair = keypair
 				elem.endpoint = endpoints[i]
 				elem.counter = 0
@@ -260,8 +265,10 @@ func (device *Device) RoutineReceiveIncoming(
 					elemsByPeer[peer] = elemsForPeer
 				}
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
-				bufsArrs[i] = device.GetMessageBuffer()
-				bufs[i] = bufsArrs[i][:]
+				if tookSlot {
+					bufsArrs[i] = device.GetMessageBuffer()
+					bufs[i] = bufsArrs[i][:]
+				}
 				continue
 
 			// otherwise it is a fixed size & handshake related packet
@@ -647,9 +654,7 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
 			continue
 		}
 
-		// the plaintext sits behind the (untouched) padding and the header
-		start := int(elem.padding)
-		scratch = append(scratch, elem.buffer[start:start+MessageTransportOffsetContent+len(elem.packet)])
+		scratch = append(scratch, elem.tunFrame()) // lx
 	}
 
 	peer.rxBytes.Add(rxBytesLen)

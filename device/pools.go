@@ -71,6 +71,7 @@ func (device *Device) PopulatePools() {
 	device.pool.outboundElements = &sync.Pool{New: func() any {
 		return new(QueueOutboundElement)
 	}}
+	device.populatePacketSizing() // lx
 }
 
 func (device *Device) GetInboundElementsContainer() *QueueInboundElementsContainer {
@@ -104,6 +105,12 @@ func (device *Device) GetMessageBuffer() *[MaxMessageSize]byte {
 }
 
 func (device *Device) PutMessageBuffer(msg *[MaxMessageSize]byte) {
+	// lx: an inbound element queued in a compact buffer has no read slot, and
+	// its release sites still pass elem.buffer here, as upstream wrote them
+	// (lx_packet_sized.go).
+	if msg == nil {
+		return
+	}
 	device.pool.messageBuffers.Put(msg)
 }
 
@@ -126,6 +133,7 @@ func (device *Device) GetInboundElement() *QueueInboundElement {
 }
 
 func (device *Device) PutInboundElement(elem *QueueInboundElement) {
+	device.settleInbound(elem) // lx
 	elem.clearPointers()
 	device.pool.inboundElements.Put(elem)
 }
