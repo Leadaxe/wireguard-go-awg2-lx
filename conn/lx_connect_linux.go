@@ -17,6 +17,7 @@ package conn
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -43,6 +44,8 @@ const (
 
 type connectState struct {
 	enabled atomic.Bool
+	// logf, when set, receives a line for every connect and disconnect.
+	logf atomic.Pointer[func(format string, args ...any)]
 	// gate is held shared by a sender from the moment it finds its socket
 	// connected until its datagrams are written, and exclusively to connect
 	// or disconnect. A datagram built without a destination therefore never
@@ -78,6 +81,19 @@ func (c *connectState) family(is6 bool) *connectFamily {
 	return &c.v4
 }
 
+func (c *connectState) name(f *connectFamily) string {
+	if f == &c.v6 {
+		return "ipv6"
+	}
+	return "ipv4"
+}
+
+func (c *connectState) log(format string, args ...any) {
+	if logf := c.logf.Load(); logf != nil {
+		(*logf)("connected socket: "+format, args...)
+	}
+}
+
 // reset forgets the sockets of the previous Open.
 func (c *connectState) reset() {
 	c.gate.Lock()
@@ -94,6 +110,18 @@ func (c *connectState) reset() {
 // connectListenInterval.
 func (s *StdNetBind) SetConnectedSocket() {
 	s.connect.enabled.Store(true)
+}
+
+// SetConnectedSocketLog sets where the bind reports each connect and
+// disconnect of its sockets, with the reason. It is meant for a debug log:
+// a peer that does not answer handshakes produces a disconnect every few
+// seconds.
+func (s *StdNetBind) SetConnectedSocketLog(logf func(format string, args ...any)) {
+	if logf == nil {
+		s.connect.logf.Store(nil)
+		return
+	}
+	s.connect.logf.Store(&logf)
 }
 
 // ConnectedPeer returns what the socket of the given family is connected to,
@@ -147,13 +175,17 @@ func (s *StdNetBind) connectedReceive(receiveFuncs []ReceiveFunc, v4conn, v6conn
 	state.gate.Lock()
 	state.pinned = state.wantPort != 0 && port == state.wantPort
 	state.v4.conn, state.v6.conn = v4conn, v6conn
+	wantPort, pinned := state.wantPort, state.pinned
 	state.gate.Unlock()
+	if !pinned {
+		state.log("off: the sockets are bound to port %d, not the chosen %d", port, wantPort)
+	}
 
 	wrap := func(receive ReceiveFunc, conn *net.UDPConn, family *connectFamily) ReceiveFunc {
 		return func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
 			count, err := receive(bufs, sizes, endpoints)
 			if err != nil && reportedByICMP(err) {
-				state.abandon(conn, family)
+				state.abandon(conn, family, "read", err)
 				return 0, nil
 			}
 			return count, err
@@ -179,28 +211,45 @@ func (s *StdNetBind) ResetPath() {
 	}
 	listenUntil := time.Now().Add(connectListenInterval)
 	s.connect.gate.Lock()
-	s.connect.v4.release(listenUntil)
-	s.connect.v6.release(listenUntil)
+	v4 := s.connect.v4.release(listenUntil)
+	v6 := s.connect.v6.release(listenUntil)
 	s.connect.gate.Unlock()
+	for _, released := range []struct {
+		name string
+		peer netip.AddrPort
+	}{{"ipv4", v4}, {"ipv6", v6}} {
+		if released.peer.IsValid() {
+			s.connect.log("%s disconnected from %s: path reset (handshake unanswered or route change), listening to any address for %s",
+				released.name, released.peer, connectListenInterval)
+		}
+	}
 }
 
-// release disconnects the socket. The caller holds the gate exclusively.
-func (f *connectFamily) release(retryAt time.Time) {
-	if !f.peer.IsValid() {
-		return
+// release disconnects the socket and returns what it was connected to, or
+// the zero value if it was not. The caller holds the gate exclusively.
+func (f *connectFamily) release(retryAt time.Time) netip.AddrPort {
+	peer := f.peer
+	if !peer.IsValid() {
+		return peer
 	}
 	f.peer = netip.AddrPort{}
 	f.retryAt = retryAt
 	disconnectSocket(f.conn)
+	return peer
 }
 
-// abandon disconnects conn after an error made its connection suspect.
-func (c *connectState) abandon(conn *net.UDPConn, f *connectFamily) {
+// abandon disconnects conn after an error on the given operation made its
+// connection suspect.
+func (c *connectState) abandon(conn *net.UDPConn, f *connectFamily, op string, cause error) {
+	var peer netip.AddrPort
 	c.gate.Lock()
 	if f.conn == conn {
-		f.release(time.Now().Add(connectRetryInterval))
+		peer = f.release(time.Now().Add(connectRetryInterval))
 	}
 	c.gate.Unlock()
+	if peer.IsValid() {
+		c.log("%s disconnected from %s: %s: %v, retry in %s", c.name(f), peer, op, cause, connectRetryInterval)
+	}
 }
 
 // acquire reports whether conn is connected to peer, connecting it first if
@@ -233,20 +282,30 @@ func (c *connectState) mayConnect(conn *net.UDPConn, f *connectFamily, peer neti
 }
 
 func (c *connectState) establish(conn *net.UDPConn, f *connectFamily, peer netip.AddrPort) bool {
+	var line string
 	c.gate.Lock()
-	defer c.gate.Unlock()
 	switch {
 	case !c.mayConnect(conn, f, peer):
 	case f.peer == peer:
 	case f.peer.IsValid():
-		f.release(time.Time{})
+		previous := f.release(time.Time{})
 		f.foreign = true
-	case connectSocket(conn, peer) != nil:
-		f.retryAt = time.Now().Add(connectRetryInterval)
+		line = fmt.Sprintf("%s disconnected from %s: a second destination %s, unconnected until the bind is reopened", c.name(f), previous, peer)
 	default:
-		f.peer = peer
+		if err := connectSocket(conn, peer); err != nil {
+			f.retryAt = time.Now().Add(connectRetryInterval)
+			line = fmt.Sprintf("%s connect to %s: %v, retry in %s", c.name(f), peer, err, connectRetryInterval)
+		} else {
+			f.peer = peer
+			line = fmt.Sprintf("%s connected to %s", c.name(f), peer)
+		}
 	}
-	return f.conn == conn && f.peer == peer
+	connected := f.conn == conn && f.peer == peer
+	c.gate.Unlock()
+	if line != "" {
+		c.log("%s", line)
+	}
+	return connected
 }
 
 func connectSocket(conn *net.UDPConn, peer netip.AddrPort) error {
@@ -328,7 +387,7 @@ func (s *StdNetBind) sendConnected(conn *net.UDPConn, writer batchWriter, is6, o
 	if !connectionSuspect(err) {
 		return true, err
 	}
-	s.connect.abandon(conn, family)
+	s.connect.abandon(conn, family, "send", err)
 	return false, nil
 }
 

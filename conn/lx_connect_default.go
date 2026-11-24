@@ -22,6 +22,9 @@ func (c *connectState) reset() {}
 // SetConnectedSocket is a no-op on this platform.
 func (s *StdNetBind) SetConnectedSocket() {}
 
+// SetConnectedSocketLog is a no-op on this platform.
+func (s *StdNetBind) SetConnectedSocketLog(logf func(format string, args ...any)) {}
+
 // ConnectedPeer always returns the zero value on this platform.
 func (s *StdNetBind) ConnectedPeer(is6 bool) netip.AddrPort {
 	return netip.AddrPort{}
