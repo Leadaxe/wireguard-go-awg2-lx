@@ -128,7 +128,7 @@ type Device struct {
 		transport atomic.Uint32
 	}
 
-	ipackets [5]*obfChain
+	ipackets [5]atomic.Pointer[obfChain]
 
 	// lx: sing-box-lx SPEC 009 — decoy datagrams generated per handshake.
 	// When set, SendHandshakeInitiation sends these datagrams before the
