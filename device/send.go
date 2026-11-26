@@ -244,8 +244,8 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 			burst = append(burst, decoy)
 		}
 	}
-	for _, ipacket := range peer.device.ipackets {
-		if ipacket != nil {
+	for i := range peer.device.ipackets {
+		if ipacket := peer.device.ipackets[i].Load(); ipacket != nil {
 			buf := make([]byte, ipacket.ObfuscatedLen(0))
 			ipacket.Obfuscate(buf, nil)
 			burst = append(burst, buf)
