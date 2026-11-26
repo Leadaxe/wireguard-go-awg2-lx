@@ -97,7 +97,7 @@ func (device *Device) RebindIfSessionStale() bool {
 	var stale []*Peer
 	device.peers.RLock()
 	for _, peer := range device.peers.keyMap {
-		if peer.isRunning.Load() && device.sessionProvablyDead(peer) {
+		if peer.runningState.isRunning.Load() && device.sessionProvablyDead(peer) {
 			stale = append(stale, peer)
 		}
 	}

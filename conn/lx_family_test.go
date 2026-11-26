@@ -42,10 +42,10 @@ func TestOpenKeepsV4WhenV6FamilyUnavailable(t *testing.T) {
 	if len(fns) == 0 {
 		t.Fatal("Open returned no receive funcs")
 	}
-	if bind.ipv4 == nil {
+	if len(bind.v4) == 0 {
 		t.Fatal("v4 socket missing after v6 degradation")
 	}
-	if bind.ipv6 != nil {
+	if len(bind.v6) > 0 {
 		t.Fatal("v6 socket unexpectedly open")
 	}
 
@@ -97,10 +97,10 @@ func TestOpenKeepsV6WhenV4FamilyUnavailable(t *testing.T) {
 	if len(fns) == 0 {
 		t.Fatal("Open returned no receive funcs")
 	}
-	if bind.ipv6 == nil {
+	if len(bind.v6) == 0 {
 		t.Fatal("v6 socket missing after v4 degradation")
 	}
-	if bind.ipv4 != nil {
+	if len(bind.v4) > 0 {
 		t.Fatal("v4 socket unexpectedly open")
 	}
 }

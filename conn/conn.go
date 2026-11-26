@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -19,13 +20,29 @@ const (
 	IdealBatchSize = 128 // maximum number of packets handled per read and write
 )
 
+// ReceivedPacket describes a packet read by a [ReceiveFunc].
+type ReceivedPacket struct {
+	// Offset is the starting byte offset.
+	Offset int
+	// Size is the size of the packet.
+	Size int
+	// Endpoint is the associated [Endpoint].
+	Endpoint Endpoint
+}
+
+func (r *ReceivedPacket) Bytes(slab []byte) []byte {
+	return slab[r.Offset : r.Offset+r.Size : r.Offset+r.Size]
+}
+
 // A ReceiveFunc receives at least one packet from the network and writes them
-// into packets. On a successful read it returns the number of elements of
-// sizes, packets, and endpoints that should be evaluated. Some elements of
-// sizes may be zero, and callers should ignore them. Callers must pass a sizes
-// and eps slice with a length greater than or equal to the length of packets.
-// These lengths must not exceed the length of the associated Bind.BatchSize().
-type ReceiveFunc func(packets [][]byte, sizes []int, eps []Endpoint) (n int, err error)
+// into slab. On a successful read it returns the number of elements of
+// packets that should be evaluated. Callers must pass a length of packets equal
+// to the associated [Bind.BatchSize].
+//
+// On error the caller retries indefinitely, unless the error is (or wraps)
+// net.ErrClosed. The caller applies no pacing of its own. A ReceiveFunc that
+// can return an error without blocking must rate-limit itself.
+type ReceiveFunc func(slab []byte, packets []ReceivedPacket) (n int, err error)
 
 // A Bind listens on a port for both IPv6 and IPv4 UDP traffic.
 //
@@ -59,6 +76,93 @@ type Bind interface {
 	BatchSize() int
 
 	SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte)
+}
+
+// An Option configures a [Bind].
+type Option interface {
+	apply(*config)
+}
+
+type optionFunc func(*config)
+
+func (f optionFunc) apply(config *config) {
+	f(config)
+}
+
+type config struct {
+	sockets int
+}
+
+func defaultConfig() config {
+	return config{
+		sockets: 1,
+	}
+}
+
+// WithSockets requests that the [Bind] listens on n sockets per address family.
+// n must be at least 1.
+//
+// [Bind.Open] will return at least n [ReceiveFunc]s per family. Implementations
+// may choose to return more [ReceiveFunc]s than was requested. Callers must
+// consult the number returned by Open rather than assume they got n.
+//
+// Errors are returned if more sockets are requested than the OS supports or if
+// the per-process limit was reached.
+//
+// Platforms that do not support this option silently ignore the request, and
+// open a single socket per address family. Currently only implemented on Linux,
+// via SO_REUSEPORT.
+func WithSockets(n int) Option {
+	return optionFunc(func(config *config) {
+		config.sockets = n
+	})
+}
+
+// MultiSocketBind is a Bind that operates on more than one socket per address
+// family. The count is fixed between Open and Close.
+type MultiSocketBind interface {
+	Bind
+
+	// SendTo is [Bind.Send] directed at one of the Bind's send sockets.
+	// Data sent with the same flow id leaves from the same socket.
+	SendTo(flow int, bufs [][]byte, ep Endpoint, offset int) error
+}
+
+// SendToOf returns bind's socket-aware send, or [Bind.Send] for a Bind with a
+// single socket.
+func SendToOf(bind Bind) func(flow int, bufs [][]byte, ep Endpoint, offset int) error {
+	if s, ok := bind.(MultiSocketBind); ok {
+		return s.SendTo
+	}
+	return func(_ int, bufs [][]byte, ep Endpoint, offset int) error {
+		return bind.Send(bufs, ep, offset)
+	}
+}
+
+// A NamedBind is a [Bind] that labels the [ReceiveFunc]s it returns from Open.
+type NamedBind interface {
+	Bind
+
+	// ReceiveNames returns one label per ReceiveFunc returned by the most recent
+	// call to Open, in the same order.
+	ReceiveNames() []string
+}
+
+// NamesOf returns a label for each of fns, which must be the slice returned
+// by bind's most recent [Bind.Open]. For a Bind that cannot name its own
+// [ReceiveFunc]s it falls back to [ReceiveFunc.PrettyName] prefixed with the
+// index.
+func NamesOf(bind Bind, fns []ReceiveFunc) []string {
+	if nb, ok := bind.(NamedBind); ok {
+		if names := nb.ReceiveNames(); len(names) == len(fns) {
+			return names
+		}
+	}
+	names := make([]string, len(fns))
+	for i, fn := range fns {
+		names[i] = strconv.Itoa(i) + "/" + fn.PrettyName()
+	}
+	return names
 }
 
 // BindSocketToInterface is implemented by Bind objects that support being

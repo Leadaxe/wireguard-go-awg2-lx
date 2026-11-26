@@ -50,24 +50,25 @@ import (
  */
 
 type QueueOutboundElement struct {
-	buffer []byte // sing-allocated buffer holding the packet data
-	// packet is always a slice of "buffer". The starting offset in buffer
-	// is either:
-	//  a) plaintextOffset() = MessageEncapsulatingTransportSize+padding+MessageTransportHeaderSize (plaintext)
-	//  b) 0 (post-encryption)
-	packet  []byte
-	nonce   uint64   // nonce for encryption
-	keypair *Keypair // keypair for encryption
-	peer    *Peer    // related peer
-	// lx: AmneziaWG — the transport padding (uapi s4) this element carries in
-	// front of its transport header. Captured when the element is created so
-	// the element stays self-consistent if the device is reconfigured while it
-	// is in flight. Its first 12 bytes double as the AWG 3.x header-protection
-	// nonce.
+	buffer *packetBuf // shared packet buffer that contains packet
+	packet []byte     // packet is always a slice of buffer.slab
+	// plaintextOffset describes the pre-encryption offset of packet within
+	// buffer.slab. The encryption process grows packet on both ends to make
+	// room for any potential encapsulating transport, WireGuard header, and
+	// tail padding.
+	plaintextOffset int
+	nonce           uint64   // nonce for encryption
+	keypair         *Keypair // keypair for encryption
+	peer            *Peer    // related peer
+	// lx: AmneziaWG — the transport padding (uapi s4) the element was laid out
+	// for; its first 12 bytes double as the AWG 3.x header-protection nonce.
 	padding uint32
 	// lx: AmneziaWG 3.x — with content padding / random trailers a keepalive
 	// is no longer the only 32-byte transport message, so it is flagged.
 	isKeepalive bool
+	// lx: the buffer holds this packet only (not a shared read slab), so the
+	// element may lay out the AWG datagram around it (lx_buffers.go).
+	ownsBuffer bool
 }
 
 type QueueOutboundElementsContainer struct {
@@ -80,23 +81,6 @@ type QueueOutboundElementsContainer struct {
 	elems   []*QueueOutboundElement
 }
 
-func (device *Device) NewOutboundElement() *QueueOutboundElement {
-	elem := device.GetOutboundElement()
-	elem.buffer = device.GetOutboundBuffer(MaxMessageSize)
-	elem.nonce = 0
-	elem.padding = device.paddings.transport.Load()
-	elem.isKeepalive = false
-	// keypair and peer were cleared (if necessary) by clearPointers.
-	return elem
-}
-
-// plaintextOffset is where this element's plaintext starts in buffer: behind
-// the (sagernet) encapsulation headroom, the AWG transport padding and the
-// transport header, all of which RoutineEncryption fills in place.
-func (elem *QueueOutboundElement) plaintextOffset() int {
-	return MessageEncapsulatingTransportSize + int(elem.padding) + MessageTransportHeaderSize
-}
-
 // clearPointers clears elem fields that contain pointers.
 // This makes the garbage collector's life easier and
 // avoids accidentally keeping other objects around unnecessarily.
@@ -106,29 +90,40 @@ func (elem *QueueOutboundElement) clearPointers() {
 	elem.packet = nil
 	elem.keypair = nil
 	elem.peer = nil
+	elem.padding = 0         // lx
+	elem.isKeepalive = false // lx
+	elem.ownsBuffer = false  // lx
 }
 
-/* Queues a keepalive if no packets are queued for peer
- */
+// SendKeepalive queues a keepalive if no packets are queued for
+// peer.
 func (peer *Peer) SendKeepalive() {
-	if len(peer.queue.staged) == 0 && peer.isRunning.Load() {
-		elem := peer.device.NewOutboundElement()
-		elem.isKeepalive = true
-		offset := elem.plaintextOffset()
-		elem.packet = elem.buffer[offset:offset]
+	var stagedDelta int
+	if len(peer.queue.staged) == 0 {
+		elem := peer.device.GetOutboundElement()
+		elem.isKeepalive = true                    // lx
+		if !peer.device.placeOutbound(elem, nil) { // lx: AWG layout, lx_buffers.go
+			elem.buffer = peer.device.getSmallPacketBuf()
+			elem.plaintextOffset = MessageEncapsulatingTransportSize + MessageTransportHeaderSize
+		}
 		elemsContainer := peer.device.GetOutboundElementsContainer()
 		elemsContainer.elems = append(elemsContainer.elems, elem)
-		select {
-		case peer.queue.staged <- elemsContainer:
-			peer.stagedPackets.Add(1)
-			peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
-		default:
-			peer.device.PutOutboundBuffer(elem.buffer)
+		if queued := peer.doIfRunning(func() {
+			select {
+			case peer.queue.staged <- elemsContainer:
+				peer.stagedPackets.Add(1)
+				stagedDelta++
+				peer.device.log.Verbosef("%v - Sending keepalive packet", peer)
+			default:
+				peer.device.PutOutboundElement(elem)
+				peer.device.PutOutboundElementsContainer(elemsContainer)
+			}
+		}); !queued {
 			peer.device.PutOutboundElement(elem)
 			peer.device.PutOutboundElementsContainer(elemsContainer)
 		}
 	}
-	peer.SendStagedPackets()
+	peer.SendStagedPackets(stagedDelta)
 }
 
 // SendPriorityMessage invokes the [PeerPriorityMessageFunc] callback if one is
@@ -161,47 +156,41 @@ func (peer *Peer) SendPriorityMessage() {
 	}
 
 	// get pooled elements
-	elem := peer.device.NewOutboundElement()
+	elem := peer.device.GetOutboundElement()
 	elemsContainer := peer.device.GetOutboundElementsContainer()
 	elemsContainer.elems = append(elemsContainer.elems, elem)
-	packetQueued := false
-	defer func() {
-		if !packetQueued {
-			peer.device.PutOutboundBuffer(elem.buffer)
-			peer.device.PutOutboundElement(elem)
-			peer.device.PutOutboundElementsContainer(elemsContainer)
-		}
-	}()
 
-	// initialize outbound element
-	offset := elem.plaintextOffset()
-	n := copy(elem.buffer[offset:], msg)
-	elem.packet = elem.buffer[offset : offset+n]
+	// initialize outbound element; lx: laid out for the AWG transport padding
+	// and tail, in a buffer of its own (lx_buffers.go)
+	if !peer.device.placeOutbound(elem, msg) {
+		peer.device.PutOutboundElement(elem)
+		peer.device.PutOutboundElementsContainer(elemsContainer)
+		return
+	}
 	elem.peer = peer
+	peer.queue.nonceMu.Lock()
+	defer peer.queue.nonceMu.Unlock()
 	elem.nonce = keypair.sendNonce.Add(1) - 1
 	if elem.nonce >= RejectAfterMessages {
 		keypair.sendNonce.Store(RejectAfterMessages)
+		peer.device.PutOutboundElement(elem)
+		peer.device.PutOutboundElementsContainer(elemsContainer)
 		return
 	}
 	elem.keypair = keypair
 
 	// add to parallel and sequential queue
-	if peer.isRunning.Load() {
-		elemsContainer.filling.Add(1)
-		peer.queuedOutboundPackets.Add(1)
-		peer.queue.outbound.c <- elemsContainer
-		peer.device.queue.encryption.c <- elemsContainer
-		packetQueued = true
-	}
+	peer.queuedOutboundPackets.Add(1)
+	peer.queueOutboundIfRunning(elemsContainer)
 }
 
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)
-		peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttempts())
+		peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttempts()) // lx
 	}
 
-	timeout := peer.device.rekeyMinTimeout()
+	timeout := peer.device.rekeyMinTimeout() // lx
 
 	peer.handshake.mutex.RLock()
 	if sinceIncludingSleep(peer.handshake.lastSentHandshake) < timeout {
@@ -215,17 +204,36 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		peer.handshake.mutex.Unlock()
 		return nil
 	}
+	// handshakeOnUserSend is flipped false after lastSentHandshake checks,
+	// enabling eventual transmission at a future call of this method, while
+	// still honoring [RekeyTimeout].
+	peer.handshakeOnUserSend.Store(false)
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
-
-	peer.device.log.Verbosef("%v - Sending handshake initiation", peer)
 
 	candidates := peer.resolveEndpoints()
 
 	msg, err := peer.device.CreateMessageInitiation(peer)
 	if err != nil {
-		peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+		if err != errPeerStopped {
+			peer.device.log.Errorf("%v - Failed to create initiation message: %v", peer, err)
+		}
 		return err
+	}
+	handshakeType := ""
+	if msg.HasKEM {
+		if isRetry {
+			handshakeType = " (hybrid, retry)"
+		} else {
+			handshakeType = " (hybrid)"
+		}
+		msg.IsRetry = isRetry
+	}
+	peer.device.log.Verbosef("%v - Sending handshake initiation%s", peer, handshakeType)
+
+	sz := MessageInitiationSize
+	if msg.HasKEM {
+		sz = MessageHybridInitiationSize
 	}
 
 	var sendBuffer [][]byte
@@ -269,15 +277,15 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	// lx: AmneziaWG datagram layout: [S1 random padding][initiation][random
 	// trailer]. The padding's first 12 bytes are the header-protection nonce.
 	padding := int(peer.device.paddings.init.Load())
-	trailerLen := max(peer.randomTrailer(padding+MessageInitiationSize), 0)
+	trailerLen := max(peer.randomTrailer(padding+sz), 0)
 
-	sendBuf := make([]byte, MessageEncapsulatingTransportSize+padding+MessageInitiationSize+trailerLen)
+	sendBuf := make([]byte, MessageEncapsulatingTransportSize+padding+sz+trailerLen)
 	buf := sendBuf[MessageEncapsulatingTransportSize:]
 
 	crypt := buf[:padding]
 	rand.Read(crypt)
 
-	packet := buf[padding : padding+MessageInitiationSize]
+	packet := buf[padding : padding+sz]
 	if err := msg.marshal(packet); err != nil {
 		peer.device.log.Errorf("%v - Failed to marshal initiation message: %v", peer, err)
 		return err
@@ -296,10 +304,23 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		cip.XORKeyStream(packet, packet)
 	}
 
-	rand.Read(buf[padding+MessageInitiationSize:])
+	rand.Read(buf[padding+sz:])
 
 	sendBuffer = append(sendBuffer, sendBuf)
 
+	if isRetry {
+		if msg.HasKEM {
+			peer.device.config.metrics.MessageHybridInitiationTXAttemptRetry.Add(1)
+		} else {
+			peer.device.config.metrics.MessageInitiationTXAttemptRetry.Add(1)
+		}
+	} else {
+		if msg.HasKEM {
+			peer.device.config.metrics.MessageHybridInitiationTXAttemptInitial.Add(1)
+		} else {
+			peer.device.config.metrics.MessageInitiationTXAttemptInitial.Add(1)
+		}
+	}
 	err = peer.sendHandshakeDatagrams(sendBuffer, candidates) // lx: SPEC 101
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
@@ -309,30 +330,44 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	return err
 }
 
-func (peer *Peer) SendHandshakeResponse() error {
+func (peer *Peer) SendHandshakeResponse(isRetry bool) error {
 	peer.handshake.mutex.Lock()
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
-	peer.device.log.Verbosef("%v - Sending handshake response", peer)
-
 	response, err := peer.device.CreateMessageResponse(peer)
 	if err != nil {
-		peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
+		if err != errPeerStopped {
+			peer.device.log.Errorf("%v - Failed to create response message: %v", peer, err)
+		}
 		return err
 	}
+	handshakeType := ""
+	if response.HasKEM {
+		if isRetry {
+			handshakeType = " (hybrid, retry)"
+		} else {
+			handshakeType = " (hybrid)"
+		}
+		response.IsRetry = isRetry
+	}
+	peer.device.log.Verbosef("%v - Sending handshake response%s", peer, handshakeType)
 
+	sz := MessageResponseSize
+	if response.HasKEM {
+		sz = MessageHybridResponseSize
+	}
 	// lx: AmneziaWG datagram layout: [S2 random padding][response][random trailer].
 	padding := int(peer.device.paddings.response.Load())
-	trailerLen := max(peer.randomTrailer(padding+MessageResponseSize), 0)
+	trailerLen := max(peer.randomTrailer(padding+sz), 0)
 
-	sendBuf := make([]byte, MessageEncapsulatingTransportSize+padding+MessageResponseSize+trailerLen)
+	sendBuf := make([]byte, MessageEncapsulatingTransportSize+padding+sz+trailerLen)
 	buf := sendBuf[MessageEncapsulatingTransportSize:]
 
 	crypt := buf[:padding]
 	rand.Read(crypt)
 
-	packet := buf[padding : padding+MessageResponseSize]
+	packet := buf[padding : padding+sz]
 	if err := response.marshal(packet); err != nil {
 		peer.device.log.Errorf("%v - Failed to marshal response message: %v", peer, err)
 		return err
@@ -349,6 +384,12 @@ func (peer *Peer) SendHandshakeResponse() error {
 	peer.timersAnyAuthenticatedPacketTraversal()
 	peer.timersAnyAuthenticatedPacketSent()
 
+	if response.HasKEM {
+		peer.device.config.metrics.MessageHybridResponseTXAttempt.Add(1)
+	} else {
+		peer.device.config.metrics.MessageResponseTXAttempt.Add(1)
+	}
+
 	cip, err := peer.device.HeaderProtectionCipher(crypt)
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to protect response message: %v", peer, err)
@@ -358,7 +399,7 @@ func (peer *Peer) SendHandshakeResponse() error {
 		cip.XORKeyStream(packet, packet)
 	}
 
-	rand.Read(buf[padding+MessageResponseSize:])
+	rand.Read(buf[padding+sz:])
 
 	// TODO: allocation could be avoided
 	err = peer.SendBuffers([][]byte{sendBuf})
@@ -370,17 +411,11 @@ func (peer *Peer) SendHandshakeResponse() error {
 }
 
 func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
-	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
+	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.packetMeta.Endpoint.DstToString())
 
 	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
-	msgType := device.headers.cookie.Load().PickOne()
-
-	reply, err := device.cookieChecker.CreateReply(
-		initiatingElem.packet,
-		sender,
-		initiatingElem.endpoint.DstToBytes(),
-		msgType,
-	)
+	msgType := device.headers.cookie.Load().PickOne() // lx: AmneziaWG H3
+	reply, err := device.cookieChecker.CreateReply(initiatingElem.packet, sender, initiatingElem.packetMeta.Endpoint.DstToBytes(), msgType)
 	if err != nil {
 		device.log.Errorf("Failed to create cookie reply: %v", err)
 		return err
@@ -413,8 +448,10 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
 
 	rand.Read(buf[padding+MessageCookieReplySize:])
 
+	device.config.metrics.MessageCookieReplyTXAttempt.Add(1)
 	// TODO: allocation could be avoided
-	device.net.bind.Send([][]byte{sendBuf}, initiatingElem.endpoint, MessageEncapsulatingTransportSize)
+	device.net.sendTo(0, [][]byte{sendBuf}, initiatingElem.packetMeta.Endpoint, MessageEncapsulatingTransportSize)
+
 	return nil
 }
 
@@ -423,94 +460,142 @@ func (peer *Peer) keepKeyFreshSending() {
 	if keypair == nil {
 		return
 	}
+	txHandshake := peer.handshakeOnUserSend.Load()
 	nonce := keypair.sendNonce.Load()
-	if nonce > RekeyAfterMessages || (keypair.isInitiator && sinceIncludingSleep(keypair.created) > peer.device.keyRefreshTimeoutSending()) {
+	if txHandshake || nonce > RekeyAfterMessages || (keypair.isInitiator && sinceIncludingSleep(keypair.created) > peer.device.keyRefreshTimeoutSending()) {
 		peer.SendHandshakeInitiation(false)
 	}
 }
 
-func (device *Device) RoutineReadFromTUN() {
+// copyPacketBufIfFits copies the prefix of src.slab ending at the final packet
+// into dst.slab if that prefix+[outboundPlaintextTailroom] fits. It reports
+// whether the copy occurred. Packet descriptors must be in offset ascending order.
+func copyPacketBufIfFits(dst, src *packetBuf, packets []tun.ReadPacket) bool {
+	if dst == nil || len(packets) < 1 {
+		return false
+	}
+	// validate tail descriptor as it relates to src
+	tailPkt := packets[len(packets)-1]
+	if tailPkt.Offset < 0 || tailPkt.Size < 1 {
+		return false
+	}
+	end := tailPkt.Offset + tailPkt.Size
+	if end < tailPkt.Offset || end > len(src.slab) ||
+		outboundPlaintextTailroom > len(src.slab)-end {
+		return false
+	}
+	// validate src fits in dst
+	if end+outboundPlaintextTailroom > len(dst.slab) {
+		return false
+	}
+	copy(dst.slab, src.slab[:end])
+	return true
+}
+
+func (device *Device) RoutineReadFromTUN(id int, queue tun.Reader) {
 	defer func() {
-		device.log.Verbosef("Routine: TUN reader - stopped")
+		device.log.Verbosef("Routine: TUN reader %d - stopped", id)
 		device.state.stopping.Done()
 		device.queue.encryption.wg.Done()
 	}()
 
-	device.log.Verbosef("Routine: TUN reader - started")
+	device.log.Verbosef("Routine: TUN reader %d - started", id)
 
 	var (
 		batchSize   = device.BatchSize()
+		packets     = make([]tun.ReadPacket, batchSize)
+		fullSizeBuf = device.getPacketBuf()
+		smallBuf    *packetBuf
 		readErr     error
 		elems       = make([]*QueueOutboundElement, batchSize)
-		bufs        = make([][]byte, batchSize)
 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
 		count       = 0
-		sizes       = make([]int, batchSize)
 	)
 
-	// lx: a queued packet must not pin a MaxMessageSize buffer, so read buffers
-	// are sized for the MTU when the TUN reads one packet at a time
-	// (lx_packet_sized.go)
-	readSize := device.tunReadSize(device.paddings.transport.Load())
+	if device.hasDistinctSmallPacketBufPool() {
+		smallBuf = device.getSmallPacketBuf()
+	}
+
+	defer func() {
+		fullSizeBuf.decRef()
+		if smallBuf != nil {
+			smallBuf.decRef()
+		}
+	}()
+
 	for i := range elems {
-		elems[i] = device.newTunReadElement(readSize)
-		bufs[i] = elems[i].buffer[:]
+		elems[i] = device.GetOutboundElement()
 	}
 
 	defer func() {
 		for _, elem := range elems {
 			if elem != nil {
-				device.PutOutboundBuffer(elem.buffer)
 				device.PutOutboundElement(elem)
 			}
 		}
 	}()
 
+	var (
+		buf          *packetBuf // either fullSizeBuf or smallBuf
+		bufHandedOff bool
+	)
+
 	for {
-		// lx: AmneziaWG — read behind the transport padding (s4) as well as the
-		// header, so RoutineEncryption can build the whole datagram in place.
-		padding := device.paddings.transport.Load()
-		offset := MessageEncapsulatingTransportSize + int(padding) + MessageTransportHeaderSize
-		// lx: the MTU or the padding may have grown past what the buffers were
-		// sized for
-		if need := device.tunReadSize(padding); need > readSize {
-			readSize = need
-			device.resizeTunRead(elems, bufs, readSize)
+		if bufHandedOff {
+			if buf == smallBuf {
+				smallBuf.decRef()
+				smallBuf = device.getSmallPacketBuf()
+			} else {
+				fullSizeBuf.decRef()
+				fullSizeBuf = device.getPacketBuf()
+			}
+		}
+		buf = fullSizeBuf
+		bufHandedOff = false
+
+		// lx: send_by_mtu — a TUN that hands over one packet per read reads it
+		// straight into a buffer of its own (lx_buffers.go)
+		byMTU := device.tunReadByMTU(batchSize)
+		var mtuBuf *packetBuf
+		if byMTU {
+			mtuBuf = device.mtuReadBuf()
+			buf = mtuBuf
 		}
 
 		// read packets
-		count, readErr = device.tun.device.Read(bufs, sizes, offset)
-		for i := 0; i < count; i++ {
-			if sizes[i] < 1 {
-				continue
-			}
-			if device.tunReadOverran(offset+sizes[i], readSize, padding) { // lx: may be cut short
+		count, readErr = queue.Read(buf.slab, packets)
+		if !byMTU && copyPacketBufIfFits(smallBuf, fullSizeBuf, packets[:count]) {
+			buf = smallBuf
+		}
+		awg := device.awgLayout() // lx
+
+		for i, meta := range packets[:count] {
+			if meta.Size < 1 || meta.Size > MaxContentSize {
 				continue
 			}
 
-			elem := elems[i]
-			elem.padding = padding
-			elem.isKeepalive = false
-			elem.packet = bufs[i][offset : offset+sizes[i]]
+			// explicitly pin slice capacity, so downstream expansion of length
+			// never leak into an adjacent packet
+			packet := buf.slab[meta.Offset : meta.Offset+meta.Size : meta.Offset+meta.Size+outboundPlaintextTailroom]
 
 			// lookup peer
 			var peer *Peer
-			switch elem.packet[0] >> 4 {
+			switch packet[0] >> 4 {
 			case 4:
-				if len(elem.packet) < ipv4.HeaderLen {
+				if len(packet) < ipv4.HeaderLen {
 					continue
 				}
-				src := netip.AddrFrom4([4]byte(elem.packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]))
-				dst := netip.AddrFrom4([4]byte(elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]))
-				peer = device.allowedips.LookupFromPacket(src, dst, elem.packet)
+				src := netip.AddrFrom4([4]byte(packet[IPv4offsetSrc : IPv4offsetSrc+net.IPv4len]))
+				dst := netip.AddrFrom4([4]byte(packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]))
+				peer = device.allowedips.LookupFromPacket(src, dst, packet)
 
 			case 6:
-				if len(elem.packet) < ipv6.HeaderLen {
+				if len(packet) < ipv6.HeaderLen {
 					continue
 				}
-				src := netip.AddrFrom16([16]byte(elem.packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]))
-				dst := netip.AddrFrom16([16]byte(elem.packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]))
-				peer = device.allowedips.LookupFromPacket(src, dst, elem.packet)
+				src := netip.AddrFrom16([16]byte(packet[IPv6offsetSrc : IPv6offsetSrc+net.IPv6len]))
+				dst := netip.AddrFrom16([16]byte(packet[IPv6offsetDst : IPv6offsetDst+net.IPv6len]))
+				peer = device.allowedips.LookupFromPacket(src, dst, packet)
 
 			default:
 				device.log.Verbosef("Received packet with unknown IP version")
@@ -519,27 +604,47 @@ func (device *Device) RoutineReadFromTUN() {
 			if peer == nil {
 				continue
 			}
+
+			elem := elems[i]
+			switch {
+			case byMTU:
+				// lx: the packet's own buffer, with room behind it up to the slab
+				buf.incRef()
+				elem.buffer = buf
+				elem.packet = buf.slab[meta.Offset : meta.Offset+meta.Size]
+				elem.plaintextOffset = meta.Offset
+				elem.padding = device.paddings.transport.Load()
+				elem.ownsBuffer = true
+			case awg:
+				// lx: AmneziaWG — the packet is copied into a buffer of its own laid
+				// out behind the transport padding, with room for the 3.x tail; a
+				// shared slab has 64 bytes between packets
+				if !device.placeOutbound(elem, packet) {
+					continue
+				}
+			default:
+				buf.incRef()
+				bufHandedOff = true
+				elem.buffer = buf
+				elem.packet = packet
+				elem.plaintextOffset = meta.Offset
+			}
+
 			elemsForPeer, ok := elemsByPeer[peer]
 			if !ok {
 				elemsForPeer = device.GetOutboundElementsContainer()
 				elemsByPeer[peer] = elemsForPeer
 			}
 			elemsForPeer.elems = append(elemsForPeer.elems, elem)
-			elems[i] = device.newTunReadElement(readSize) // lx
-			bufs[i] = elems[i].buffer[:]
+			elems[i] = device.GetOutboundElement()
+		}
+		if byMTU {
+			mtuBuf.decRef() // lx: each element holds its own reference
 		}
 
 		for peer, elemsForPeer := range elemsByPeer {
-			if peer.isRunning.Load() {
-				peer.StagePackets(elemsForPeer)
-				peer.SendStagedPackets()
-			} else {
-				for _, elem := range elemsForPeer.elems {
-					device.PutOutboundBuffer(elem.buffer)
-					device.PutOutboundElement(elem)
-				}
-				device.PutOutboundElementsContainer(elemsForPeer)
-			}
+			stagedDelta := peer.StagePackets(elemsForPeer)
+			peer.SendStagedPackets(stagedDelta)
 			delete(elemsByPeer, peer)
 		}
 
@@ -615,54 +720,23 @@ func gatherPacketBytes(packetSlices [][]byte, offset int, destination []byte) bo
 	return false
 }
 
-// outboundLayout sizes an injected (InputPacket/InputPackets) element for a
-// plaintext of totalLength bytes: the plaintext goes at offset — behind the
-// AWG transport padding (s4) and the transport header, which RoutineEncryption
-// fills in place — and the buffer keeps room for the bytes appended before
-// sealing (see outboundTailroom) plus the AEAD tag. allocLength is 0 when the
-// packet cannot fit a MaxMessageSize datagram.
-func (device *Device) outboundLayout(totalLength int) (padding uint32, offset, allocLength int) {
-	padding = device.paddings.transport.Load()
-	offset = MessageEncapsulatingTransportSize + int(padding) + MessageTransportHeaderSize
-	base := offset + totalLength + chacha20poly1305.Overhead
-	if base+PaddingMultiple > MaxMessageSize {
-		return padding, offset, 0
-	}
-	allocLength = min(base+device.outboundTailroom(offset+totalLength), MaxMessageSize)
-	return padding, offset, allocLength
-}
-
-// outboundTailroom is the headroom kept after the plaintext of a tightly
-// allocated element for what RoutineEncryption appends before sealing: the
-// WireGuard multiple-of-16 pad, or under AWG 3.x the content padding addition
-// / random trailer. Both are clamped to the buffer when they would not fit, so
-// this only decides how much of the obfuscation an injected packet can carry —
-// never whether it is safe. datagramSize is the datagram without any addition.
-func (device *Device) outboundTailroom(datagramSize int) int {
-	room := PaddingMultiple
-	if addition := device.contentPaddingAddition.Load(); !addition.IsZero() {
-		room = max(room, int(min(addition.Hi(), MaxMessageSize)))
-	} else if device.randomTrailers.Load() {
-		room = max(room, DefaultUdpWindow-datagramSize)
-	}
-	return room
-}
-
 func (device *Device) newInputElement(packetSlices ...[]byte) *QueueOutboundElement {
 	var totalLength int
 	for _, packetSlice := range packetSlices {
 		totalLength += len(packetSlice)
 	}
+	// lx: laid out behind the AWG transport padding, with room for the 3.x tail
+	// (lx_buffers.go); without AWG it is upstream's layout
 	padding, offset, allocLength := device.outboundLayout(totalLength)
 	if allocLength == 0 {
 		return nil
 	}
 	elem := device.GetOutboundElement()
-	elem.buffer = device.GetOutboundBuffer(allocLength)
-	elem.nonce = 0
+	elem.buffer = device.getInputPacketBuf(allocLength)
+	elem.plaintextOffset = offset
 	elem.padding = padding
-	elem.isKeepalive = false
-	packet := elem.buffer[offset:]
+	elem.ownsBuffer = true
+	packet := elem.buffer.slab[elem.plaintextOffset:]
 	var n int
 	for _, packetSlice := range packetSlices {
 		n += copy(packet[n:], packetSlice)
@@ -682,14 +756,18 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 			unmatched = append(unmatched, packetRef)
 			continue
 		}
-		if peer.stagedPackets.Load() >= maxStagedPackets || peer.queuedOutboundPackets.Load() >= maxQueuedOutboundPackets {
+		containers := elemsByPeer[peer]
+		var collected int
+		if len(containers) > 0 {
+			collected = (len(containers)-1)*conn.IdealBatchSize + len(containers[len(containers)-1].elems)
+		}
+		if peer.stagedFull(collected) || peer.queuedOutboundPackets.Load()+int32(collected) >= maxQueuedOutboundPackets {
 			continue
 		}
 		elem := device.newInputElement(packetRef.PacketSlices...)
 		if elem == nil {
 			continue
 		}
-		containers := elemsByPeer[peer]
 		if len(containers) == 0 || len(containers[len(containers)-1].elems) >= conn.IdealBatchSize {
 			containers = append(containers, device.GetOutboundElementsContainer())
 			elemsByPeer[peer] = containers
@@ -698,10 +776,11 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef 
 		elemsForPeer.elems = append(elemsForPeer.elems, elem)
 	}
 	for peer, containers := range elemsByPeer {
+		var stagedDelta int
 		for _, elemsForPeer := range containers {
-			peer.stageInputPackets(elemsForPeer)
+			stagedDelta += peer.StagePackets(elemsForPeer)
 		}
-		peer.SendStagedPackets()
+		peer.SendStagedPackets(stagedDelta)
 	}
 	return unmatched
 }
@@ -717,7 +796,7 @@ func (peer *Peer) WritePackets(packets [][]byte) {
 		}
 		batch := packets[:min(len(packets), conn.IdealBatchSize)]
 		packets = packets[len(batch):]
-		if peer.stagedPackets.Load() >= maxStagedPackets {
+		if peer.stagedFull(0) {
 			continue
 		}
 		elemsForPeer := device.GetOutboundElementsContainer()
@@ -727,53 +806,25 @@ func (peer *Peer) WritePackets(packets [][]byte) {
 				elemsForPeer.elems = append(elemsForPeer.elems, elem)
 			}
 		}
-		peer.stageInputPackets(elemsForPeer)
-		peer.SendStagedPackets()
-	}
-}
-
-func (peer *Peer) stageInputPackets(elemsForPeer *QueueOutboundElementsContainer) {
-	if len(elemsForPeer.elems) > 0 && peer.isRunning.Load() {
-		peer.StagePackets(elemsForPeer)
-		return
-	}
-	for _, elem := range elemsForPeer.elems {
-		peer.device.PutOutboundBuffer(elem.buffer)
-		peer.device.PutOutboundElement(elem)
-	}
-	peer.device.PutOutboundElementsContainer(elemsForPeer)
-}
-
-func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) {
-	peer.stagedPackets.Add(int32(len(elems.elems)))
-	for {
-		select {
-		case peer.queue.staged <- elems:
-			return
-		default:
-			peer.dropOldestStaged()
+		if len(elemsForPeer.elems) == 0 {
+			device.PutOutboundElementsContainer(elemsForPeer)
+			continue
 		}
+		peer.SendStagedPackets(peer.StagePackets(elemsForPeer))
 	}
 }
 
-func (peer *Peer) dropOldestStaged() bool {
-	select {
-	case tooOld := <-peer.queue.staged:
-		peer.stagedPackets.Add(-int32(len(tooOld.elems)))
-		for _, elem := range tooOld.elems {
-			peer.device.PutOutboundBuffer(elem.buffer)
-			peer.device.PutOutboundElement(elem)
-		}
-		peer.device.PutOutboundElementsContainer(tooOld)
-		return true
-	default:
+func (peer *Peer) stagedFull(pending int) bool {
+	if peer.stagedPackets.Load()+int32(pending) < maxStagedPackets {
 		return false
 	}
+	keypair := peer.keypairs.Current()
+	return keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || sinceIncludingSleep(keypair.created) >= peer.device.keychainExpireTime()
 }
 
 func (peer *Peer) waitOutboundSpace() bool {
 	for {
-		if !peer.isRunning.Load() {
+		if !peer.runningState.isRunning.Load() {
 			return false
 		}
 		if peer.queuedOutboundPackets.Load() < maxQueuedOutboundPackets {
@@ -785,7 +836,7 @@ func (peer *Peer) waitOutboundSpace() bool {
 		}
 		ready := peer.outboundSpace.ready
 		peer.outboundSpace.Unlock()
-		if !peer.isRunning.Load() {
+		if !peer.runningState.isRunning.Load() {
 			return false
 		}
 		if peer.queuedOutboundPackets.Load() < maxQueuedOutboundPackets {
@@ -811,14 +862,84 @@ func (peer *Peer) wakeOutboundWaiters() {
 	peer.outboundSpace.Unlock()
 }
 
-func (peer *Peer) SendStagedPackets() {
+// StagePackets attempts to enqueue elements into the peer's staging queue.
+// If the queue is full, its oldest member is dropped to make room.
+// If the peer is not running, the data is quietly dropped.
+//
+// It returns a delta for len(peer.queue.staged) operations, which must be
+// passed in a subsequent call to [Peer.SendStagedPackets], where global stage
+// queue accounting changes are committed.
+//
+// [Peer.nonceMu] relies on this function being non-blocking.
+func (peer *Peer) StagePackets(elems *QueueOutboundElementsContainer) (stagedDelta int) {
+	if running := peer.doIfRunning(func() {
+		peer.stagedPackets.Add(int32(len(elems.elems)))
+		for {
+			select {
+			case peer.queue.staged <- elems:
+				stagedDelta++
+				return
+			default:
+			}
+			select {
+			case tooOld := <-peer.queue.staged:
+				peer.stagedPackets.Add(-int32(len(tooOld.elems)))
+				stagedDelta--
+				for _, elem := range tooOld.elems {
+					peer.device.PutOutboundElement(elem)
+				}
+				peer.device.PutOutboundElementsContainer(tooOld)
+			default:
+			}
+		}
+	}); !running {
+		for _, elem := range elems.elems {
+			peer.device.PutOutboundElement(elem)
+		}
+		peer.device.PutOutboundElementsContainer(elems)
+	}
+	return stagedDelta
+}
+
+// SendStagedPackets sends any staged packets to Peer, if a valid keypair and
+// nonce are available.
+//
+// It accepts a delta for preceding len(peer.queue.staged) operations. Said
+// delta gets combined with what it performs, and committed to device-wide stage
+// queue accounting, if a global staged queue limit is configured.
+//
+// SendStagedPackets accepts stagedDelta in order to intentionally delay
+// device-wide stage queue accounting commit until the end of this func. This
+// strategy limits staged queue accounting to long-lived elements, i.e. those
+// awaiting a future handshake, and does not include elements that stage and are
+// immediately transmitted.
+func (peer *Peer) SendStagedPackets(stagedDelta int) {
+	defer func() {
+		if peer.device.config.queueStagedGlobalLimit > 0 {
+			stagedCount := peer.device.queue.stagedCount.Add(int64(stagedDelta))
+			if stagedCount > peer.device.config.queueStagedGlobalLimit {
+				// TODO(jwhited): count when this happens
+				peer.FlushStagedPackets(int(stagedCount - peer.device.config.queueStagedGlobalLimit))
+			}
+		}
+	}()
+
+	// SendStagedPackets may be called concurrently. Serialize nonce assignment
+	// with outbound enqueue so packets are transmitted in nonce order; excessive
+	// reordering can cause the receiver's replay filter to drop packets.
+	//
+	// Unlock explicitly before each return to avoid holding nonceMu across
+	// SendHandshakeInitiation, whose expensive work would stall TUN readers.
+	peer.queue.nonceMu.Lock()
 top:
 	if len(peer.queue.staged) == 0 || !peer.device.isUp() {
+		peer.queue.nonceMu.Unlock()
 		return
 	}
 
 	keypair := peer.keypairs.Current()
 	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || sinceIncludingSleep(keypair.created) >= peer.device.keychainExpireTime() {
+		peer.queue.nonceMu.Unlock()
 		peer.SendHandshakeInitiation(false)
 		return
 	}
@@ -827,6 +948,7 @@ top:
 		var elemsContainerOOO *QueueOutboundElementsContainer
 		select {
 		case elemsContainer := <-peer.queue.staged:
+			stagedDelta--
 			peer.stagedPackets.Add(-int32(len(elemsContainer.elems)))
 			i := 0
 			for _, elem := range elemsContainer.elems {
@@ -849,7 +971,7 @@ top:
 			elemsContainer.elems = elemsContainer.elems[:i]
 
 			if elemsContainerOOO != nil {
-				peer.StagePackets(elemsContainerOOO) // XXX: Out of order, but we can't front-load go chans
+				stagedDelta += peer.StagePackets(elemsContainerOOO) // XXX: Out of order, but we can't front-load go chans
 			}
 
 			if len(elemsContainer.elems) == 0 {
@@ -857,31 +979,41 @@ top:
 				goto top
 			}
 
-			// add to parallel and sequential queue
-			if peer.isRunning.Load() {
-				elemsContainer.filling.Add(1)
-				peer.queuedOutboundPackets.Add(int32(len(elemsContainer.elems)))
-				peer.queue.outbound.c <- elemsContainer
-				peer.device.queue.encryption.c <- elemsContainer
-			} else {
-				for _, elem := range elemsContainer.elems {
-					peer.device.PutOutboundBuffer(elem.buffer)
-					peer.device.PutOutboundElement(elem)
-				}
-				peer.device.PutOutboundElementsContainer(elemsContainer)
-			}
+			peer.queuedOutboundPackets.Add(int32(len(elemsContainer.elems)))
+			peer.queueOutboundIfRunning(elemsContainer)
 
 			if elemsContainerOOO != nil {
 				goto top
 			}
 		default:
+			peer.queue.nonceMu.Unlock()
 			return
 		}
 	}
 }
 
-func (peer *Peer) FlushStagedPackets() {
-	for peer.dropOldestStaged() {
+// FlushStagedPackets drains elements from [Peer.queue.staged] up to limit. If
+// limit is zero, FlushStagedPackets drains all elements.
+func (peer *Peer) FlushStagedPackets(limit int) {
+	var flushed int
+	defer func() {
+		peer.device.queue.stagedCount.Add(-(int64(flushed)))
+	}()
+	for {
+		if limit > 0 && flushed == limit {
+			return
+		}
+		select {
+		case elemsContainer := <-peer.queue.staged:
+			peer.stagedPackets.Add(-int32(len(elemsContainer.elems)))
+			flushed++
+			for _, elem := range elemsContainer.elems {
+				peer.device.PutOutboundElement(elem)
+			}
+			peer.device.PutOutboundElementsContainer(elemsContainer)
+		default:
+			return
+		}
 	}
 }
 
@@ -965,6 +1097,31 @@ func newPaddingRNG() *mrand.ChaCha8 {
 	return mrand.NewChaCha8(seed)
 }
 
+// layOutForEncryption makes sure the plaintext of elem sits where the AWG
+// datagram can be built around it in place: behind the current transport
+// padding, in a buffer of its own when a padding or a 3.x tail is in use. A
+// plain WireGuard element stays where upstream put it, a shared slab included.
+// False when the packet fits no datagram under the current layout.
+func (device *Device) layOutForEncryption(elem *QueueOutboundElement, padding uint32) bool {
+	if !device.awgLayout() && elem.padding == 0 {
+		return true
+	}
+	offset := awgPlaintextOffset(padding)
+	if elem.ownsBuffer && elem.padding == padding && elem.plaintextOffset == offset {
+		return true
+	}
+	if elem.ownsBuffer && offset+len(elem.packet)+chacha20poly1305.Overhead <= len(elem.buffer.slab) {
+		// an element read under another padding, or a TUN read into its own
+		// buffer at the TUN's offset: move it in place (memmove)
+		n := copy(elem.buffer.slab[offset:], elem.packet)
+		elem.packet = elem.buffer.slab[offset : offset+n]
+		elem.plaintextOffset = offset
+		elem.padding = padding
+		return true
+	}
+	return device.regrowOutbound(elem)
+}
+
 // lx:end awg3
 
 /* Encrypts the elements in the queue
@@ -981,41 +1138,32 @@ func (device *Device) RoutineEncryption(id int) {
 
 	for elemsContainer := range device.queue.encryption.c {
 		for _, elem := range elemsContainer.elems {
-			// lx: AmneziaWG datagram layout, built in place in elem.buffer:
-			//   [encap headroom][s4 random padding][16-byte header][sealed content]
-			// The device's current s4 is authoritative: an element produced
-			// under another value — the TUN reader captures s4 before it blocks
-			// in Read, so the batch in flight across an IpcSet (notably the very
-			// first one after start) still carries the old layout — is relocated
-			// to the current offset; the peer classifies by the current s4.
-			padding := int(device.paddings.transport.Load())
-			headerStart := MessageEncapsulatingTransportSize + padding
-			offset := headerStart + MessageTransportHeaderSize
-			if int(elem.padding) != padding || (len(elem.packet) > 0 && &elem.packet[0] != &elem.buffer[offset]) {
-				if offset+len(elem.packet)+chacha20poly1305.Overhead > len(elem.buffer) && !device.regrowOutbound(elem, offset) {
-					// an element allocated for a smaller s4 (reconfigured while
-					// in flight) that fits no datagram under the current one
-					device.log.Verbosef("%v - Packet dropped: no room to relocate under transport padding %d", elem.peer, padding)
-					elem.packet = nil
-					continue
-				}
-				n := copy(elem.buffer[offset:], elem.packet) // overlap-safe (memmove)
-				elem.packet = elem.buffer[offset : offset+n]
-				elem.padding = uint32(padding)
+			// lx: AmneziaWG datagram layout, built in place in the element's
+			// buffer: [encap headroom][s4 random padding][16-byte header][sealed
+			// content]. The device's current s4 is authoritative: an element
+			// produced under another value is moved (lx_buffers.go).
+			padding := device.paddings.transport.Load()
+			if !device.layOutForEncryption(elem, padding) {
+				device.log.Verbosef("%v - Packet dropped: no room under transport padding %d", elem.peer, padding)
+				elem.packet = nil
+				continue
 			}
+			pad := int(elem.padding)
+			headerStart := elem.plaintextOffset - MessageTransportHeaderSize
+			start := headerStart - pad - MessageEncapsulatingTransportSize
 
 			// The datagram this element becomes is a size this path carries.
-			elem.peer.noteUDPWindow(uint32(padding + MessageTransportSize + len(elem.packet)))
+			elem.peer.noteUDPWindow(uint32(pad + MessageTransportSize + len(elem.packet)))
 
 			// fill the transport padding; its first 12 bytes are the AWG 3.x
 			// header-protection nonce
-			crypt := elem.buffer[MessageEncapsulatingTransportSize:headerStart]
+			crypt := elem.buffer.slab[headerStart-pad : headerStart]
 			if len(crypt) > 0 {
 				padRNG.Read(crypt)
 			}
 
 			// populate header fields
-			header := elem.buffer[headerStart:offset]
+			header := elem.buffer.slab[headerStart:elem.plaintextOffset]
 
 			fieldType := header[0:4]
 			fieldReceiver := header[4:8]
@@ -1027,7 +1175,7 @@ func (device *Device) RoutineEncryption(id int) {
 
 			// trailing plaintext bytes: the AWG 3.x content padding addition,
 			// else a random trailer, else the WireGuard multiple-of-16 pad
-			datagramSize := padding + MessageTransportSize + len(elem.packet)
+			datagramSize := pad + MessageTransportSize + len(elem.packet)
 			paddingSize := elem.peer.randomPaddingAddition(datagramSize)
 			if paddingSize < 0 {
 				paddingSize = elem.peer.randomTrailer(datagramSize)
@@ -1035,8 +1183,8 @@ func (device *Device) RoutineEncryption(id int) {
 			if paddingSize < 0 {
 				paddingSize = calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
 			}
-			// never spill past the buffer: injected elements are allocated by
-			// size (see outboundLayout), so the addition is clamped to fit
+			// never spill past the room the element has: upstream pins the
+			// capacity of a packet in a shared slab, an own buffer ends at its slab
 			if room := cap(elem.packet) - len(elem.packet) - chacha20poly1305.Overhead; paddingSize > room {
 				paddingSize = max(room, 0)
 			}
@@ -1048,11 +1196,15 @@ func (device *Device) RoutineEncryption(id int) {
 
 			binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
 			elem.packet = elem.keypair.send.Seal(
-				elem.buffer[:offset],
+				header,
 				nonce[:],
 				elem.packet,
 				nil,
 			)
+
+			// re-slice packet to include the padding and encapsulating transport space
+			end := headerStart + len(elem.packet)
+			elem.packet = elem.buffer.slab[start:end]
 
 			// AWG 3.x header protection: the 16-byte header is XORed with a
 			// ChaCha20 keystream keyed by the header key and salted with the
@@ -1076,16 +1228,13 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 	device := peer.device
 	defer func() {
 		defer device.log.Verbosef("%v - Routine: sequential sender - stopped", peer)
-		peer.stopping.Done()
+		peer.runningState.queueReaders.Done()
 	}()
 	device.log.Verbosef("%v - Routine: sequential sender - started", peer)
 
 	bufs := make([][]byte, 0, max(maxBatchSize, conn.IdealBatchSize))
 
-	for elemsContainer := range peer.queue.outbound.c {
-		if elemsContainer == nil {
-			return
-		}
+	for elemsContainer := range peer.queue.outbound {
 		peer.processOutboundContainer(elemsContainer, bufs[:0])
 	}
 }
@@ -1115,7 +1264,7 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 	// sole owner of the container until Put hands it back to the pool.
 	elemsContainer.filling.Wait()
 
-	if !peer.isRunning.Load() {
+	if !peer.runningState.isRunning.Load() {
 		// peer has been stopped; return re-usable elems to the shared pool.
 		// This is an optimization only. It is possible for the peer to be stopped
 		// immediately after this check, in which case, elem will get processed.
@@ -1124,7 +1273,6 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 		// that we never accidentally keep timers alive longer than necessary.
 		peer.releaseOutboundPackets(len(elemsContainer.elems))
 		for _, elem := range elemsContainer.elems {
-			device.PutOutboundBuffer(elem.buffer)
 			device.PutOutboundElement(elem)
 		}
 		return
@@ -1133,10 +1281,10 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 	dataSent := false
 	for _, elem := range elemsContainer.elems {
 		if elem.packet == nil {
-			// dropped by RoutineEncryption (header protection failure)
+			// lx: dropped by RoutineEncryption (no room, header protection failure)
 			continue
 		}
-		if !elem.isKeepalive {
+		if !elem.isKeepalive { // lx: AWG 3.x pads keepalives too
 			dataSent = true
 		}
 		scratch = append(scratch, elem.packet)
@@ -1154,7 +1302,6 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
 	}
 	peer.releaseOutboundPackets(len(elemsContainer.elems))
 	for _, elem := range elemsContainer.elems {
-		device.PutOutboundBuffer(elem.buffer)
 		device.PutOutboundElement(elem)
 	}
 	err = unwrapGSODisabled(device.log, err) // lx: SPEC 101

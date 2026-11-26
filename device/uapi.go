@@ -187,6 +187,9 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
 			peer.handshake.mutex.RLock()
 			keyf("public_key", (*[32]byte)(&peer.handshake.remoteStatic))
 			keyf("preshared_key", (*[32]byte)(&peer.handshake.presharedKey))
+			if peer.handshake.hybridHandshake {
+				sendf("hybrid=true")
+			}
 			peer.handshake.mutex.RUnlock()
 			sendf("protocol_version=1")
 			peer.endpoint.Lock()
@@ -566,7 +569,7 @@ func (peer *ipcSetPeer) handlePostConfig() {
 		if peer.pkaOn {
 			peer.SendKeepalive()
 		}
-		peer.SendStagedPackets()
+		peer.SendStagedPackets(0)
 	}
 }
 
@@ -645,6 +648,14 @@ func (device *Device) handlePeerLine(
 		if err != nil {
 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set preshared key: %w", err)
 		}
+
+	case "hybrid":
+		device.log.Verbosef("%v - UAPI: Updating hybrid", peer.Peer)
+		if value != "true" && value != "false" {
+			return ipcErrorf(ipc.IpcErrorInvalid, "failed to replace hybrid, invalid value: %v", value)
+		}
+
+		peer.SetHybridHandshake(value == "true")
 
 	case "endpoint":
 		device.log.Verbosef("%v - UAPI: Updating endpoint", peer.Peer)

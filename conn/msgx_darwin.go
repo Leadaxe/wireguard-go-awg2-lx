@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	M "github.com/sagernet/sing/common/metadata"
@@ -24,7 +25,9 @@ import (
 
 const supportsMsgX = true
 
-const msgXBatchSize = IdealBatchSize
+const msgXBatchSize = 64
+
+const msgXInitialRegionSize = 2048
 
 // msghdrX mirrors XNU's struct msghdr_x used by sendmsg_x/recvmsg_x.
 // The "no support for address or ancillary data" comment in uipc_syscalls.c
@@ -41,6 +44,7 @@ type msghdrX struct {
 }
 
 type msgXState struct {
+	regionSize  atomic.Int32
 	singlePeer  atomic.Bool
 	connected4  atomic.Bool
 	connected6  atomic.Bool
@@ -54,6 +58,7 @@ func (m *msgXState) reset() {
 	m.connected4.Store(false)
 	m.connected6.Store(false)
 	m.endpoint.Store(nil)
+	m.regionSize.Store(msgXInitialRegionSize)
 }
 
 func (m *msgXState) connectedFlag(isV6 bool) *atomic.Bool {
@@ -182,19 +187,9 @@ var sendMsgXPool = sync.Pool{New: func() any {
 
 // sendMsgX sends msgs with a single syscall, over a connected socket when the
 // bind has one and by addressing every message otherwise.
-func (s *StdNetBind) sendMsgX(conn *net.UDPConn, msgs []ipv6.Message) error {
-	var (
-		rawConn syscall.RawConn
-		isV6    bool
-	)
-	s.mu.Lock()
-	if conn == s.ipv6 {
-		rawConn = s.ipv6RC
-		isV6 = true
-	} else {
-		rawConn = s.ipv4RC
-	}
-	s.mu.Unlock()
+func (s *StdNetBind) sendMsgX(sock *stdNetSocket, msgs []ipv6.Message) error {
+	rawConn := sock.rc
+	isV6 := sock.isV6
 	destination := M.AddrPortFromNet(msgs[0].Addr)
 	connected, err := s.ensureConnected(rawConn, isV6, destination)
 	if err != nil {
@@ -251,30 +246,26 @@ type receiveMsgXState struct {
 	names []unix.RawSockaddrInet6
 }
 
-func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc, error) {
-	rawConn, err := conn.SyscallConn()
-	if err != nil {
-		return nil, err
-	}
+func (s *StdNetBind) makeReceiveMsgX(sock *stdNetSocket) ReceiveFunc {
+	rawConn := sock.rc
+	isV6 := sock.isV6
 	state := &receiveMsgXState{
 		hdrs:  make([]msghdrX, msgXBatchSize),
 		iovs:  make([]unix.Iovec, msgXBatchSize),
 		names: make([]unix.RawSockaddrInet6, msgXBatchSize),
 	}
-	return func(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+	return func(slab []byte, packets []ReceivedPacket) (int, error) {
 		// The endpoint is stored before the flag is raised, so reading the flag
 		// first never pairs a connected socket with a stale endpoint.
 		var connectedEndpoint *StdNetEndpoint
 		if s.msgx.connectedFlag(isV6).Load() {
 			connectedEndpoint = s.msgx.endpoint.Load()
 		}
-		count := len(bufs)
-		if count > msgXBatchSize {
-			count = msgXBatchSize
-		}
+		regionSize := min(int(s.msgx.regionSize.Load()), len(slab))
+		count := max(1, min(len(packets), msgXBatchSize, len(slab)/regionSize))
 		for i := 0; i < count; i++ {
-			state.iovs[i] = unix.Iovec{Base: &bufs[i][0]}
-			state.iovs[i].SetLen(len(bufs[i]))
+			state.iovs[i] = unix.Iovec{Base: &slab[i*regionSize]}
+			state.iovs[i].SetLen(regionSize)
 			state.hdrs[i] = msghdrX{}
 			if connectedEndpoint == nil {
 				state.hdrs[i].Msg.Name = (*byte)(unsafe.Pointer(&state.names[i]))
@@ -302,9 +293,13 @@ func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc,
 			if errno == unix.ECONNREFUSED {
 				return 0, nil
 			}
-			if connectedEndpoint != nil && rebindErrno(errno) {
+			if errno == unix.EBADF {
+				return 0, fmt.Errorf("%w: %w", net.ErrClosed, errno)
+			}
+			if errno == unix.ENOTCONN || connectedEndpoint != nil && rebindErrno(errno) {
 				return 0, fmt.Errorf("%w: %w", ErrRebindRequired, errno)
 			}
+			time.Sleep(time.Second / 3)
 			return 0, errno
 		}
 		if n == 0 {
@@ -312,14 +307,16 @@ func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc,
 		}
 		numMsgs := int(n)
 		for i := 0; i < numMsgs; i++ {
-			sizes[i] = int(state.hdrs[i].DataLen)
-			if sizes[i] > 3 && s.hasReserved() { // lx: only strip reserved bytes for WARP (see hasReserved)
-				bufs[i][1] = 0
-				bufs[i][2] = 0
-				bufs[i][3] = 0
+			packets[i].Offset = i * regionSize
+			packets[i].Size = int(state.hdrs[i].DataLen)
+			// recvmsg_x reports the truncated length without MSG_TRUNC, so a
+			// datagram filling its region may have been cut short.
+			if packets[i].Size == regionSize && regionSize < maxDatagramSize {
+				packets[i].Size = 0
+				s.msgx.regionSize.CompareAndSwap(int32(regionSize), int32(min(regionSize*2, maxDatagramSize)))
 			}
 			if connectedEndpoint != nil {
-				eps[i] = connectedEndpoint
+				packets[i].Endpoint = connectedEndpoint
 				continue
 			}
 			var addrPort netip.AddrPort
@@ -332,8 +329,8 @@ func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc,
 				port := name4.Port<<8 | name4.Port>>8
 				addrPort = netip.AddrPortFrom(netip.AddrFrom4(name4.Addr), port)
 			}
-			eps[i] = &StdNetEndpoint{AddrPort: addrPort}
+			packets[i].Endpoint = &StdNetEndpoint{AddrPort: addrPort}
 		}
 		return numMsgs, nil
-	}, nil
+	}
 }

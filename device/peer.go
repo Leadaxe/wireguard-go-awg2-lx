@@ -7,8 +7,10 @@ package device
 
 import (
 	"container/list"
+	"encoding/binary"
 	"errors"
 	"net/netip"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -18,14 +20,29 @@ import (
 )
 
 type Peer struct {
-	isRunning         atomic.Bool
-	keypairs          Keypairs
-	handshake         Handshake
-	device            *Device
-	stopping          sync.WaitGroup // routines pending stop
-	txBytes           atomic.Uint64  // bytes send to peer (endpoint)
-	rxBytes           atomic.Uint64  // bytes received from peer
-	lastHandshakeNano atomic.Int64   // nano seconds since epoch
+	runningState struct {
+		// isRunning is swapped across [Peer.Start] and [Peer.Stop]. Direct
+		// access loads are best-effort and inherently racey.
+		isRunning atomic.Bool
+		// queueWriters is the count of outstanding goroutines performing
+		// potential write operations against [Peer.queue].* channels.
+		// It is semantically similar to a [sync.WaitGroup], but free
+		// from the event order constraints of [sync.WaitGroup.Add]. Increments
+		// from zero may run concurrent to the "waiting" side.
+		queueWriters atomic.Int32
+		// queueReaders is the count of outstanding goroutines performing
+		// potential read operations against [Peer.queue.inbound] and
+		// [Peer.queue.outbound].
+		queueReaders sync.WaitGroup
+	}
+
+	keypairs            Keypairs
+	handshake           Handshake
+	device              *Device
+	txBytes             atomic.Uint64 // bytes send to peer (endpoint)
+	rxBytes             atomic.Uint64 // bytes received from peer
+	lastHandshakeNano   atomic.Int64  // nanoseconds since epoch
+	handshakeOnUserSend atomic.Bool   // attempt handshake following next outbound transport
 
 	sessionState struct {
 		sync.Mutex
@@ -43,7 +60,7 @@ type Peer struct {
 	// deleteOnIdle indicates whether the peer should be deleted when idle
 	// because it was auto-created via a Device.PeerLookupFunc.
 	//
-	// This field should only be set once, before the peer is started.
+	// This field should only be set once, before the peer is published.
 	deleteOnIdle bool
 
 	endpoint struct {
@@ -78,10 +95,17 @@ type Peer struct {
 		testAllowedIP atomic.Pointer[func(netip.Addr) bool]
 	}
 
+	// queue channel write operations must be wrapped by [Peer.doIfRunning]
 	queue struct {
-		staged   chan *QueueOutboundElementsContainer // staged packets before a handshake is available
-		outbound *autodrainingOutboundQueue           // sequential ordering of udp transmission
-		inbound  *autodrainingInboundQueue            // sequential ordering of tun writing
+		// nonceMu serializes nonce stamping during the outbound enqueue in
+		// [Peer.SendStagedPackets] and [Peer.SendPriorityMessage].
+		nonceMu sync.Mutex
+		// staged holds packets awaiting symmetric session establishment. staged
+		// queue operations must be accounted against [Device.queue.stagedCount]
+		// when a global staged queue limit is in effect.
+		staged   chan *QueueOutboundElementsContainer
+		outbound chan *QueueOutboundElementsContainer // sequential ordering of udp transmission
+		inbound  chan *QueueInboundElementsContainer  // sequential ordering of tun writing
 	}
 
 	cookieGenerator             CookieGenerator
@@ -90,9 +114,39 @@ type Peer struct {
 	// lx: AWG 3.x — the largest datagram seen on this endpoint in either
 	// direction; the ceiling for content padding and random trailers.
 	udpWindow atomic.Uint32
+
+	// flowID pins this peer's decrypted packets to a single TUN write queue
+	// when the device is a [tun.MultiQueueDevice], and its encrypted packets
+	// to a single bind socket when the bind is a [conn.MultiSocketBind].
+	// See [Peer.writeTUN] and [Peer.SendBuffers].
+	//
+	// The kernel picks a TUN queue by 5-tuple for new (or quiescent,
+	// TUN_FLOW_EXPIRE=3s) flows. A pin learned from our writes overrides
+	// the hash. Kernel delivers a packet to the stack before recording the pin,
+	// so the first reply to a flow we write leaves on the hashed queue and the
+	// rest on ours. Both queues then carry that flow briefly, which may
+	// introduce overlay reordering.
+	// See https://elixir.bootlin.com/linux/v7.0/source/drivers/net/tun.c#L461
+	//
+	// TODO match or influence kernel hashing when writing to TUN to avoid
+	// reorders. Note that the kernel hash is siphash keyed by an unexported
+	// random value. This can be overridden with TUNSETSTEERINGEBPF ioctl.
+	flowID uint32
 }
 
+// NewPeer creates and publishes an unconfigured peer for pk.
+//
+// Safe to configure post-factum in [Device.IpcSetOperation] because of the
+// global ipc mutex.
 func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
+	return device.newPeer(pk, nil, false /* deleteOnIdle */)
+}
+
+// newPeer creates a peer for pk, applies conf and deleteOnIdle, and then
+// publishes the peer into device.peers.keyMap.
+//
+// conf may be nil, in which case the peer is left unconfigured.
+func (device *Device) newPeer(pk NoisePublicKey, conf *NewPeerConfig, deleteOnIdle bool) (*Peer, error) {
 	if device.isClosed() {
 		return nil, errors.New("device closed")
 	}
@@ -116,9 +170,12 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 
 	peer.cookieGenerator.Init(pk)
 	peer.device = device
-	peer.queue.outbound = newAutodrainingOutboundQueue(device)
-	peer.queue.inbound = newAutodrainingInboundQueue(device)
-	peer.queue.staged = make(chan *QueueOutboundElementsContainer, QueueStagedSize)
+	// Public keys are uniformly distributed, so the low bytes spread fine.
+	peer.flowID = binary.LittleEndian.Uint32(pk[:4])
+
+	// staged is never closed, and it can be accessed concurrent to [Peer.Start],
+	// so we init here instead of [Peer.Start].
+	peer.queue.staged = make(chan *QueueOutboundElementsContainer, device.config.queueStagedSize)
 
 	// map public key
 	_, ok := device.peers.keyMap[pk]
@@ -126,11 +183,19 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 		return nil, errAddExistingPeer
 	}
 
+	// This field is read without locks, safe to write only because the peer
+	// is not yet reachable by any other goroutine.
+	peer.deleteOnIdle = deleteOnIdle
+
 	// pre-compute DH
 	handshake := &peer.handshake
 	handshake.mutex.Lock()
 	handshake.precomputedStaticStatic, _ = device.staticIdentity.privateKey.sharedSecret(pk)
 	handshake.remoteStatic = pk
+	if conf != nil {
+		handshake.presharedKey = conf.PresharedKey
+		handshake.hybridHandshake = conf.Hybrid
+	}
 	handshake.mutex.Unlock()
 
 	// reset endpoint
@@ -138,12 +203,19 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	peer.endpoint.val = nil
 	peer.endpoint.disableRoaming = false
 	peer.endpoint.clearSrcOnTx = false
+	if conf != nil && conf.Endpoint != nil {
+		peer.endpoint.val = conf.Endpoint
+	}
 	peer.endpoint.Unlock()
 
 	// init timers
 	peer.timersInit()
 
-	// add
+	if conf != nil {
+		peer.SetAllowedIPs(conf.AllowedIPs)
+	}
+
+	// add, concurrent access after this point
 	device.peers.keyMap[pk] = peer
 
 	return peer, nil
@@ -178,6 +250,14 @@ func (p *Peer) SetPresharedKey(psk NoisePresharedKey) {
 	p.handshake.presharedKey = psk
 }
 
+// SetHybridHandshake sets whether this peer should use hybrid post-quantum handshakes.
+// Both peers must use the same setting for communication to be possible.
+func (p *Peer) SetHybridHandshake(hybrid bool) {
+	p.handshake.mutex.Lock()
+	defer p.handshake.mutex.Unlock()
+	p.handshake.hybridHandshake = hybrid
+}
+
 // SendBuffers sends buffers to peer. WireGuard packet data in each element of
 // buffers must be preceded by MessageEncapsulatingTransportSize number of
 // bytes.
@@ -202,7 +282,7 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	}
 	peer.endpoint.Unlock()
 
-	err := peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize)
+	err := peer.device.net.sendTo(int(peer.flowID), buffers, endpoint, MessageEncapsulatingTransportSize)
 	if err == nil {
 		var totalLen uint64
 		for _, b := range buffers {
@@ -213,6 +293,12 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 		peer.device.scheduleBindUpdate()
 	}
 	return err
+}
+
+// writeTUN writes bufs to the TUN queue this peer is pinned to, keeping the
+// peer's decrypted packets in order.
+func (peer *Peer) writeTUN(bufs [][]byte, offset int) (int, error) {
+	return peer.device.tun.writeTo(int(peer.flowID), bufs, offset)
 }
 
 func (peer *Peer) String() string {
@@ -251,16 +337,20 @@ func (peer *Peer) Start() {
 	peer.state.Lock()
 	defer peer.state.Unlock()
 
-	if peer.isRunning.Load() {
+	if peer.runningState.isRunning.Load() {
 		return
 	}
 
 	device := peer.device
 	device.log.Verbosef("%v - Starting", peer)
 
+	// init inbound & outbound packet queues
+	peer.queue.outbound = make(chan *QueueOutboundElementsContainer, device.config.peerQueueOutboundSize)
+	peer.queue.inbound = make(chan *QueueInboundElementsContainer, device.config.peerQueueInboundSize)
+
 	// reset routine state
-	peer.stopping.Wait()
-	peer.stopping.Add(2)
+	peer.runningState.queueReaders.Wait()
+	peer.runningState.queueReaders.Add(2)
 	peer.queuedOutboundPackets.Store(0)
 
 	peer.handshake.mutex.Lock()
@@ -271,16 +361,13 @@ func (peer *Peer) Start() {
 
 	peer.timersStart()
 
-	device.flushInboundQueue(peer.queue.inbound.c)
-	device.flushOutboundQueue(peer.queue.outbound.c)
-
 	// Use the device batch size, not the bind batch size, as the device size is
 	// the size of the batch pools.
 	batchSize := peer.device.BatchSize()
 	go peer.RoutineSequentialSender(batchSize)
 	go peer.RoutineSequentialReceiver(batchSize)
 
-	peer.isRunning.Store(true)
+	peer.runningState.isRunning.Store(true)
 
 	// A lazily-created peer that never completes a handshake otherwise never
 	// arms its reaping timer. Arm it here, while running under state.Lock, so
@@ -317,7 +404,7 @@ func (peer *Peer) ZeroAndFlushAll() {
 	handshake.Clear()
 	handshake.mutex.Unlock()
 
-	peer.FlushStagedPackets()
+	peer.FlushStagedPackets(0)
 
 	peer.sessionState.Lock()
 	peer.sessionState.sessionExpires = time.Time{}
@@ -349,22 +436,128 @@ func (peer *Peer) ExpireCurrentKeypairs() {
 	peer.sessionState.Unlock()
 }
 
+// queueOutboundIfRunning queues elems for outbound encryption & transmission to
+// peer if peer is running, otherwise elems are returned to their respective
+// pools for later re-use.
+func (peer *Peer) queueOutboundIfRunning(elems *QueueOutboundElementsContainer) (queued bool) {
+	if queued = peer.doIfRunning(func() {
+		elems.filling.Add(1)
+		peer.queue.outbound <- elems
+		peer.device.queue.encryption.c <- elems
+	}); !queued {
+		peer.queuedOutboundPackets.Add(-int32(len(elems.elems)))
+		for _, elem := range elems.elems {
+			peer.device.PutOutboundElement(elem)
+		}
+		peer.device.PutOutboundElementsContainer(elems)
+	}
+	return queued
+}
+
+// queueInboundIfRunning queues elems for inbound decryption from peer if peer
+// is running, otherwise elems are returned to their respective pools for later
+// re-use.
+func (peer *Peer) queueInboundIfRunning(elems *QueueInboundElementsContainer) (queued bool) {
+	if queued = peer.doIfRunning(func() {
+		elems.filling.Add(1)
+		peer.queue.inbound <- elems
+		peer.device.queue.decryption.c <- elems
+	}); !queued {
+		for _, elem := range elems.elems {
+			peer.device.PutInboundElement(elem)
+		}
+		peer.device.PutInboundElementsContainer(elems)
+	}
+	return queued
+}
+
+// doIfRunning executes doQueueCrit if the [Peer] is running, i.e. the [Peer] is
+// not stopped or stopping. It returns true if doQueueCrit ran, otherwise it
+// returns false.
+//
+// doIfRunning exists to enable safe, bare (no select{}) write operations against
+// [Peer.queue].* channels.
+//
+// doIfRunning makes no guarantee about the running generation of the [Peer], i.e.
+// a [Peer] may stop then start all while a goroutine is within doIfRunning, but
+// before doQueueCrit has run.
+//
+// doIfRunning is built on the assumption that the supplied critical sections are
+// relatively cheap, as the mutually excluded peer-stopping side
+// ([Peer.waitQueueActors]) busy-waits for actors to exit.
+func (peer *Peer) doIfRunning(doQueueCrit func()) (ranCrit bool) {
+	if !peer.runningState.isRunning.Load() {
+		return false
+	}
+	peer.runningState.queueWriters.Add(1)
+	defer peer.runningState.queueWriters.Add(-1)
+	if peer.runningState.isRunning.Load() {
+		doQueueCrit()
+		return true
+	}
+	return false
+}
+
+// waitQueueActors waits for [Peer.runningState.queueWriters] and [Peer.runningState.queueReaders]
+// to reach zero. It should be called after [Peer.runningState.isRunning] is
+// swapped false.
+func (peer *Peer) waitQueueActors() {
+	drainInboundOutbound := func() {
+		for {
+			select {
+			case container := <-peer.queue.inbound:
+				container.filling.Wait()
+				for _, elem := range container.elems {
+					peer.device.PutInboundElement(elem)
+				}
+				peer.device.PutInboundElementsContainer(container)
+			case container := <-peer.queue.outbound:
+				container.filling.Wait()
+				for _, elem := range container.elems {
+					peer.device.PutOutboundElement(elem)
+				}
+				peer.device.PutOutboundElementsContainer(container)
+			default:
+				return
+			}
+		}
+	}
+
+	// Busy-wait for queue writers to return.
+	for peer.runningState.queueWriters.Load() != 0 {
+		// We drain at every iteration to give our busy-wait some meaningful
+		// work that can unblock actors performing channel writes. The goal at
+		// this point is to get them to return as soon as possible. It's ok if
+		// there are outstanding elements on packet queues once queueWriters
+		// reaches zero, our reader shutdown below will handle those stragglers.
+		drainInboundOutbound()
+		// We don't want our busy-wait starving actors, so explicitly yield back
+		// to the runtime, to bias towards actor goroutines getting CPU time.
+		runtime.Gosched()
+	}
+
+	// Signal to RoutineSequentialSender and RoutineSequentialReceiver to
+	// exit. Let them deal with any outstanding elements on the associated
+	// channels.
+	close(peer.queue.inbound)
+	close(peer.queue.outbound)
+	peer.runningState.queueReaders.Wait()
+}
+
 func (peer *Peer) Stop() {
 	peer.state.Lock()
 	defer peer.state.Unlock()
 
-	if !peer.isRunning.Swap(false) {
+	if !peer.runningState.isRunning.Swap(false) {
 		return
 	}
 	peer.wakeOutboundWaiters()
 
+	peer.waitQueueActors()
+
 	peer.device.log.Verbosef("%v - Stopping", peer)
 
 	peer.timersStop()
-	// Signal that RoutineSequentialSender and RoutineSequentialReceiver should exit.
-	peer.queue.inbound.c <- nil
-	peer.queue.outbound.c <- nil
-	peer.stopping.Wait()
 	peer.device.queue.encryption.wg.Done() // no more writes to encryption queue from us
 
 	peer.ZeroAndFlushAll()
@@ -515,7 +708,7 @@ func (peer *Peer) sendHandshakeBuffers(buffers [][]byte, candidates []conn.Endpo
 	var firstErr error
 	sent := false
 	for _, endpoint := range endpoints {
-		err := peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize)
+		err := peer.device.net.sendTo(int(peer.flowID), buffers, endpoint, MessageEncapsulatingTransportSize)
 		if err == nil {
 			sent = true
 			peer.txBytes.Add(totalLen)

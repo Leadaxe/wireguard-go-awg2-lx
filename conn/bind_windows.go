@@ -15,9 +15,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
-	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/control"
-	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/wireguard-go/conn/winrio"
 	"golang.org/x/sys/windows"
@@ -76,14 +74,15 @@ type afWinRingBind struct {
 // WinRingBind uses Windows registered I/O for fast ring buffered networking.
 type WinRingBind struct {
 	externalControl     control.Func
-	reservedForEndpoint map[WinRingEndpoint][3]uint8
+	reservedAccess      sync.RWMutex
+	reservedForEndpoint map[netip.AddrPort][3]uint8
 
 	v4, v6 afWinRingBind
 	mu     sync.RWMutex
 	isOpen atomic.Uint32 // 0, 1, or 2
 }
 
-func NewDefaultBind(externalControl control.Func) Bind {
+func NewDefaultBind(externalControl control.Func, _ ...Option) Bind {
 	return NewWinRingBind(externalControl)
 }
 
@@ -93,7 +92,7 @@ func NewWinRingBind(externalControl control.Func) Bind {
 	}
 	return &WinRingBind{
 		externalControl:     externalControl,
-		reservedForEndpoint: make(map[WinRingEndpoint][3]uint8),
+		reservedForEndpoint: make(map[netip.AddrPort][3]uint8),
 	}
 }
 
@@ -150,6 +149,10 @@ func (e *WinRingEndpoint) DstIP() netip.Addr {
 		return netip.AddrFrom16(*(*[16]byte)(e.data[6:22]))
 	}
 	return netip.Addr{}
+}
+
+func (e *WinRingEndpoint) unmappedAddrPort() netip.AddrPort {
+	return netip.AddrPortFrom(e.DstIP().Unmap(), binary.BigEndian.Uint16(e.data[0:2]))
 }
 
 func (e *WinRingEndpoint) SrcIP() netip.Addr {
@@ -457,27 +460,41 @@ retry:
 	return n, &ep, nil
 }
 
-func (bind *WinRingBind) receiveIPv4(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+func (bind *WinRingBind) receiveIPv4(slab []byte, packets []ReceivedPacket) (int, error) {
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
-	n, ep, err := bind.v4.Receive(bufs[0], &bind.isOpen)
-	if n > 3 && bind.hasReserved() { // lx: only strip reserved bytes for WARP (see hasReserved)
-		common.ClearArray(bufs[0][1:4])
+	n, ep, err := bind.v4.Receive(slab, &bind.isOpen)
+	if n > 3 {
+		bind.reservedAccess.RLock()
+		_, loaded := bind.reservedForEndpoint[ep.(*WinRingEndpoint).unmappedAddrPort()]
+		bind.reservedAccess.RUnlock()
+		if loaded {
+			clear(slab[1:4])
+		}
 	}
-	sizes[0] = n
-	eps[0] = ep
+	packets[0] = ReceivedPacket{
+		Size:     n,
+		Endpoint: ep,
+	}
 	return 1, err
 }
 
-func (bind *WinRingBind) receiveIPv6(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+func (bind *WinRingBind) receiveIPv6(slab []byte, packets []ReceivedPacket) (int, error) {
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
-	n, ep, err := bind.v6.Receive(bufs[0], &bind.isOpen)
-	if n > 3 && bind.hasReserved() { // lx: only strip reserved bytes for WARP (see hasReserved)
-		common.ClearArray(bufs[0][1:4])
+	n, ep, err := bind.v6.Receive(slab, &bind.isOpen)
+	if n > 3 {
+		bind.reservedAccess.RLock()
+		_, loaded := bind.reservedForEndpoint[ep.(*WinRingEndpoint).unmappedAddrPort()]
+		bind.reservedAccess.RUnlock()
+		if loaded {
+			clear(slab[1:4])
+		}
 	}
-	sizes[0] = n
-	eps[0] = ep
+	packets[0] = ReceivedPacket{
+		Size:     n,
+		Endpoint: ep,
+	}
 	return 1, err
 }
 
@@ -538,15 +555,15 @@ func (bind *WinRingBind) Send(bufs [][]byte, endpoint Endpoint, offset int) erro
 	if !ok {
 		return ErrWrongEndpointType
 	}
+	bind.reservedAccess.RLock()
+	reserved, reservedLoaded := bind.reservedForEndpoint[nend.unmappedAddrPort()]
+	bind.reservedAccess.RUnlock()
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
 	for _, buf := range bufs {
 		buf = buf[offset:]
-		if len(buf) > 3 {
-			reserved, loaded := bind.reservedForEndpoint[*endpoint.(*WinRingEndpoint)]
-			if loaded {
-				copy(buf[1:4], reserved[:])
-			}
+		if reservedLoaded && len(buf) > 3 {
+			copy(buf[1:4], reserved[:])
 		}
 		switch nend.family {
 		case windows.AF_INET:
@@ -569,29 +586,19 @@ func (bind *WinRingBind) Send(bufs [][]byte, endpoint Endpoint, offset int) erro
 }
 
 func (bind *WinRingBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
-	endpoint, err := bind.ParseEndpoint(destination.String())
-	if err != nil {
-		panic(E.Cause(err, "parse destination as WinRingEndpoint"))
-	}
-	bind.reservedForEndpoint[*endpoint.(*WinRingEndpoint)] = reserved
-}
-
-// lx: hasReserved reports whether any Cloudflare "reserved" value is set. See
-// the StdNetBind.hasReserved comment — the unconditional receive clear would
-// corrupt an AmneziaWG magic header sitting in bytes 1-3 (small padding).
-func (bind *WinRingBind) hasReserved() bool {
-	for _, reserved := range bind.reservedForEndpoint {
-		if reserved != [3]uint8{} {
-			return true
-		}
-	}
-	return false
+	bind.reservedAccess.Lock()
+	bind.reservedForEndpoint[netip.AddrPortFrom(destination.Addr().Unmap(), destination.Port())] = reserved
+	bind.reservedAccess.Unlock()
 }
 
 func (s *StdNetBind) BindSocketToInterface4(interfaceIndex uint32, blackhole bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sysconn, err := s.ipv4.SyscallConn()
+	conn, err := firstConn(s.v4)
+	if err != nil {
+		return err
+	}
+	sysconn, err := conn.SyscallConn()
 	if err != nil {
 		return err
 	}
@@ -611,7 +618,11 @@ func (s *StdNetBind) BindSocketToInterface4(interfaceIndex uint32, blackhole boo
 func (s *StdNetBind) BindSocketToInterface6(interfaceIndex uint32, blackhole bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sysconn, err := s.ipv6.SyscallConn()
+	conn, err := firstConn(s.v6)
+	if err != nil {
+		return err
+	}
+	sysconn, err := conn.SyscallConn()
 	if err != nil {
 		return err
 	}

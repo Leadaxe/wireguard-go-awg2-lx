@@ -70,8 +70,8 @@ func TestReadDatagramCountOffload(t *testing.T) {
 	if _, _, err := full.Open(0); err != nil {
 		t.Fatal(err)
 	}
-	tx4, tx6 := full.ipv4TxOffload, full.ipv6TxOffload
-	rx4, rx6 := full.ipv4RxOffload, full.ipv6RxOffload
+	tx4, tx6 := testTxOffload(full)
+	rx4, rx6 := testRxOffload(full)
 	full.Close()
 	t.Logf("full batch: tx4=%v rx4=%v tx6=%v rx6=%v", tx4, rx4, tx6, rx6)
 	if !rx4 && !rx6 {
@@ -86,10 +86,10 @@ func TestReadDatagramCountOffload(t *testing.T) {
 		if _, _, err := small.Open(0); err != nil {
 			t.Fatal(err)
 		}
-		if small.ipv4RxOffload || small.ipv6RxOffload {
+		if srx4, srx6 := testRxOffload(small); srx4 || srx6 {
 			t.Fatalf("open %d: receive offload is on below a full batch", attempt)
 		}
-		if small.ipv4TxOffload != tx4 || small.ipv6TxOffload != tx6 {
+		if stx4, stx6 := testTxOffload(small); stx4 != tx4 || stx6 != tx6 {
 			t.Fatalf("open %d: segmentation offload changed with the read count", attempt)
 		}
 		if got := small.BatchSize(); got != 8 {
@@ -129,17 +129,13 @@ func TestReadDatagramCountDelivers(t *testing.T) {
 		}
 
 		batch := bind.BatchSize()
-		bufs := make([][]byte, batch)
-		for i := range bufs {
-			bufs[i] = make([]byte, 65535)
-		}
-		sizes := make([]int, batch)
-		endpoints := make([]Endpoint, batch)
+		slab := make([]byte, batch*65535)
+		packets := make([]ReceivedPacket, batch)
 		done := make(chan error, 1)
 		var got [][]byte
 		go func() {
 			for len(got) < datagrams {
-				n, err := receiveFuncs[0](bufs, sizes, endpoints)
+				n, err := receiveFuncs[0](slab, packets)
 				if err != nil {
 					done <- err
 					return
@@ -149,8 +145,8 @@ func TestReadDatagramCountDelivers(t *testing.T) {
 					return
 				}
 				for i := 0; i < n; i++ {
-					if sizes[i] > 0 {
-						got = append(got, bytes.Clone(bufs[i][:sizes[i]]))
+					if packets[i].Size > 0 {
+						got = append(got, bytes.Clone(packets[i].Bytes(slab)))
 					}
 				}
 			}
@@ -218,4 +214,26 @@ func TestSendMoreThanReadCount(t *testing.T) {
 			t.Fatalf("datagram %d arrived changed or out of order", i)
 		}
 	}
+}
+
+// testTxOffload and testRxOffload report the offload state of the first
+// socket of each family.
+func testTxOffload(s *StdNetBind) (v4, v6 bool) {
+	if len(s.v4) > 0 {
+		v4 = s.v4[0].txOffload.Load()
+	}
+	if len(s.v6) > 0 {
+		v6 = s.v6[0].txOffload.Load()
+	}
+	return
+}
+
+func testRxOffload(s *StdNetBind) (v4, v6 bool) {
+	if len(s.v4) > 0 {
+		v4 = s.v4[0].rxOffload
+	}
+	if len(s.v6) > 0 {
+		v6 = s.v6[0].rxOffload
+	}
+	return
 }

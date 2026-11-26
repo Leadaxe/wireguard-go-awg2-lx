@@ -10,68 +10,96 @@ import (
 
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/wireguard-go/conn"
+	"github.com/sagernet/wireguard-go/tun"
 )
 
-type WaitPool struct {
-	pool  sync.Pool
-	cond  sync.Cond
-	lock  sync.Mutex
-	count uint32 // Get calls not yet Put back
-	max   uint32
-}
+const (
+	// smallPacketBufSize is the size to be used for [packetBuf.slab]'s pooled in
+	// [Device.pool.smallPacketBufs]. It's large enough to fit WireGuard keepalive
+	// messages, WireGuard-encrypted [MaxPriorityMessageContentSize], and
+	// WireGuard-encrypted internet MTU messages.
+	smallPacketBufSize = 2048
 
-func NewWaitPool(max uint32, new func() any) *WaitPool {
-	p := &WaitPool{pool: sync.Pool{New: new}, max: max}
-	p.cond = sync.Cond{L: &p.lock}
-	return p
-}
+	internetMTU = 1500
+	// assert that [smallPacketBufSize] is sufficient to hold [internetMTU]-sized
+	// plaintext read via [tun.Device.Read], for eventual encryption and
+	// transmission as a WireGuard transport message.
+	_ uint = smallPacketBufSize -
+		tun.ReadPacketSpacing -
+		internetMTU -
+		outboundPlaintextTailroom
+	// assert that [smallPacketBufSize] is sufficient to hold [MaxPriorityMessageContentSize]-sized
+	// plaintext for eventual encryption and transmission as a WireGuard transport
+	// message. This assertion also covers keepalive messages, which only have
+	// the auth tag, accounted for in [outboundPlaintextTailroom], following
+	// the WireGuard header.
+	_ uint = smallPacketBufSize -
+		outboundPlaintextHeadroom -
+		MaxPriorityMessageContentSize -
+		outboundPlaintextTailroom
 
-func (p *WaitPool) hasAccounting() bool {
-	return p != nil && p.max != 0
-}
-
-func (p *WaitPool) Get() any {
-	if p.max != 0 {
-		p.lock.Lock()
-		for p.count >= p.max {
-			p.cond.Wait()
-		}
-		p.count++
-		p.lock.Unlock()
-	}
-	return p.pool.Get()
-}
-
-func (p *WaitPool) Put(x any) {
-	p.pool.Put(x)
-	if p.max == 0 {
-		return
-	}
-	p.lock.Lock()
-	defer p.lock.Unlock()
-	p.count--
-	p.cond.Signal()
-}
+	// minPacketBufSizeForDistinctSmallPool represents the minimum [packetBuf.slab]
+	// size at which a distinct ([Device.pool.smallPacketBufs]) is created.
+	minPacketBufSizeForDistinctSmallPool = 2 * smallPacketBufSize
+)
 
 func (device *Device) PopulatePools() {
-	device.pool.inboundElementsContainer = &sync.Pool{New: func() any {
-		s := make([]*QueueInboundElement, 0, device.BatchSize())
-		return &QueueInboundElementsContainer{elems: s}
-	}}
-	device.pool.outboundElementsContainer = &sync.Pool{New: func() any {
-		s := make([]*QueueOutboundElement, 0, max(device.BatchSize(), conn.IdealBatchSize))
-		return &QueueOutboundElementsContainer{elems: s}
-	}}
-	device.pool.messageBuffers = NewWaitPool(PreallocatedBuffersPerPool, func() any {
-		return new([MaxMessageSize]byte)
-	})
-	device.pool.inboundElements = &sync.Pool{New: func() any {
-		return new(QueueInboundElement)
-	}}
-	device.pool.outboundElements = &sync.Pool{New: func() any {
-		return new(QueueOutboundElement)
-	}}
-	device.populatePacketSizing() // lx
+	device.pool.inboundElementsContainer = &sync.Pool{
+		New: func() any {
+			s := make([]*QueueInboundElement, 0, device.BatchSize())
+			return &QueueInboundElementsContainer{elems: s}
+		},
+	}
+	device.pool.outboundElementsContainer = &sync.Pool{
+		New: func() any {
+			s := make([]*QueueOutboundElement, 0, max(device.BatchSize(), conn.IdealBatchSize))
+			return &QueueOutboundElementsContainer{elems: s}
+		},
+	}
+	device.pool.inboundElements = &sync.Pool{
+		New: func() any {
+			return new(QueueInboundElement)
+		},
+	}
+	device.pool.outboundElements = &sync.Pool{
+		New: func() any {
+			return new(QueueOutboundElement)
+		},
+	}
+	packetBufSize := singlePacketSlabSize
+	if device.BatchSize() > 1 {
+		packetBufSize = batchingSlabSize
+	}
+	device.pool.packetBufs = &sync.Pool{
+		New: func() any {
+			return newPacketBuf(packetBufSize, func(buf *packetBuf) {
+				device.pool.packetBufs.Put(buf)
+			})
+		},
+	}
+	device.pool.inputPacketBufs = &sync.Pool{
+		New: func() any {
+			return &packetBuf{cleanup: func(packetBuffer *packetBuf) {
+				_ = buf.Put(packetBuffer.slab)
+				packetBuffer.slab = nil
+				device.pool.inputPacketBufs.Put(packetBuffer)
+			}}
+		},
+	}
+	// A distinct smallPacketBufs pool makes TUN readers copy packets that fit
+	// into [smallPacketBufSize] in the interest of memory savings. Alias
+	// smallPacketBufs to the "full-sized" pool if there is little to be gained
+	// in memory savings.
+	device.pool.smallPacketBufs = device.pool.packetBufs
+	if packetBufSize >= minPacketBufSizeForDistinctSmallPool {
+		device.pool.smallPacketBufs = &sync.Pool{
+			New: func() any {
+				return newPacketBuf(smallPacketBufSize, func(buf *packetBuf) {
+					device.pool.smallPacketBufs.Put(buf)
+				})
+			},
+		}
+	}
 }
 
 func (device *Device) GetInboundElementsContainer() *QueueInboundElementsContainer {
@@ -100,32 +128,31 @@ func (device *Device) PutOutboundElementsContainer(c *QueueOutboundElementsConta
 	device.pool.outboundElementsContainer.Put(c)
 }
 
-func (device *Device) GetMessageBuffer() *[MaxMessageSize]byte {
-	return device.pool.messageBuffers.Get().(*[MaxMessageSize]byte)
+// hasDistinctSmallPacketBufPool returns true if [Device.getSmallPacketBuf]
+// will fetch from a pool independent of [Device.getPacketBuf].
+func (device *Device) hasDistinctSmallPacketBufPool() bool {
+	return device.pool.smallPacketBufs != device.pool.packetBufs
 }
 
-func (device *Device) PutMessageBuffer(msg *[MaxMessageSize]byte) {
-	// lx: an inbound element queued in a compact buffer has no read slot, and
-	// its release sites still pass elem.buffer here, as upstream wrote them
-	// (lx_packet_sized.go).
-	if msg == nil {
-		return
-	}
-	device.pool.messageBuffers.Put(msg)
+// getSmallPacketBuf returns a [*packetBuf] smaller or equal in size to what
+// [Device.getPacketBuf] returns depending on [Device] batching configuration.
+func (device *Device) getSmallPacketBuf() *packetBuf {
+	b := device.pool.smallPacketBufs.Get().(*packetBuf)
+	b.incRef()
+	return b
 }
 
-// Outbound buffers come from the sing allocator instead of the bounded
-// messageBuffers pool: the injection paths (InputPackets/Peer.WritePackets)
-// run on the caller's goroutines, which must never block on pool exhaustion,
-// and their packets are far smaller than MaxMessageSize, so they are allocated
-// by actual size. This also keeps the bounded pool exclusively for the receive
-// path, so outbound backlog can no longer starve it.
-func (device *Device) GetOutboundBuffer(size int) []byte {
-	return buf.Get(size)
+func (device *Device) getPacketBuf() *packetBuf {
+	b := device.pool.packetBufs.Get().(*packetBuf)
+	b.incRef()
+	return b
 }
 
-func (device *Device) PutOutboundBuffer(buffer []byte) {
-	_ = buf.Put(buffer)
+func (device *Device) getInputPacketBuf(size int) *packetBuf {
+	b := device.pool.inputPacketBufs.Get().(*packetBuf)
+	b.slab = buf.Get(size)
+	b.incRef()
+	return b
 }
 
 func (device *Device) GetInboundElement() *QueueInboundElement {
@@ -133,16 +160,25 @@ func (device *Device) GetInboundElement() *QueueInboundElement {
 }
 
 func (device *Device) PutInboundElement(elem *QueueInboundElement) {
-	device.settleInbound(elem) // lx
+	elem.buffer.decRef()
 	elem.clearPointers()
 	device.pool.inboundElements.Put(elem)
 }
 
+// GetOutboundElement returns a [*QueueOutboundElement] with all its fields
+// set to their respective zero values.
 func (device *Device) GetOutboundElement() *QueueOutboundElement {
-	return device.pool.outboundElements.Get().(*QueueOutboundElement)
+	elem := device.pool.outboundElements.Get().(*QueueOutboundElement)
+	elem.plaintextOffset = 0
+	elem.nonce = 0
+	// buffer, packet, keypair, and peer were cleared (if necessary) by [QueueOutboundElement.clearPointers].
+	return elem
 }
 
 func (device *Device) PutOutboundElement(elem *QueueOutboundElement) {
+	if elem.buffer != nil {
+		elem.buffer.decRef()
+	}
 	elem.clearPointers()
 	device.pool.outboundElements.Put(elem)
 }

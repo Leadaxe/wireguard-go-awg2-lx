@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: MIT
  *
- * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
+ * Copyright (C) 2017-2023 WireGuard LLC. All Rights Reserved.
  */
 
 package tun
@@ -59,7 +59,7 @@ func nanotime() int64
 
 // CreateTUN creates a Wintun interface with the given name. Should a Wintun
 // interface with the same name exist, it is reused.
-func CreateTUN(ifname string, mtu int) (Device, error) {
+func CreateTUN(ifname string, mtu int, _ ...Option) (Device, error) {
 	return CreateTUNWithRequestedGUID(ifname, WintunStaticRequestedGUID, mtu)
 }
 
@@ -144,7 +144,7 @@ func (tun *NativeTun) BatchSize() int {
 
 // Note: Read() and Write() assume the caller comes only from a single thread; there's no locking.
 
-func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+func (tun *NativeTun) Read(slab []byte, packets []ReadPacket) (int, error) {
 	tun.running.Add(1)
 	defer tun.running.Done()
 retry:
@@ -160,8 +160,14 @@ retry:
 		packet, err := tun.session.ReceivePacket()
 		switch err {
 		case nil:
-			n := copy(bufs[0][offset:], packet)
-			sizes[0] = n
+			dst := slab[ReadPacketSpacing : len(slab)-ReadPacketSpacing]
+			if len(packet) > len(dst) {
+				tun.session.ReleaseReceivePacket(packet)
+				return 0, ErrTooManySegments
+			}
+			n := copy(dst, packet)
+			packets[0].Offset = ReadPacketSpacing
+			packets[0].Size = n
 			tun.session.ReleaseReceivePacket(packet)
 			tun.rate.update(uint64(n))
 			return 1, nil

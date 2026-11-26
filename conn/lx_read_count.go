@@ -37,7 +37,7 @@ func (s *StdNetBind) SetReadDatagramCount(count int) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.ipv4 != nil || s.ipv6 != nil {
+	if len(s.v4) > 0 || len(s.v6) > 0 {
 		return ErrBindAlreadyOpen
 	}
 	s.readDatagrams.Store(int32(count))

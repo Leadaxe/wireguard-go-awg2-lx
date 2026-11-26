@@ -124,6 +124,14 @@ func newGSOHandshakePair(t *testing.T, sendErr error) *gsoHandshakePair {
 		t.Fatalf("IpcSet B: %v", err)
 	}
 
+	// Upstream creates handshake messages for running peers only.
+	if err := devA.Up(); err != nil {
+		t.Fatalf("Up A: %v", err)
+	}
+	if err := devB.Up(); err != nil {
+		t.Fatalf("Up B: %v", err)
+	}
+
 	peerA := devA.LookupPeer(pkB)
 	peerB := devB.LookupPeer(pkA)
 	if peerA == nil || peerB == nil {
@@ -169,7 +177,7 @@ func TestLXHandshakeGSORetryLog(t *testing.T) {
 			failure: "Failed to send handshake response",
 			send: func(t *testing.T, p *gsoHandshakePair) error {
 				p.consumeInitiationFromB(t)
-				return p.peerA.SendHandshakeResponse()
+				return p.peerA.SendHandshakeResponse(false)
 			},
 		},
 	}

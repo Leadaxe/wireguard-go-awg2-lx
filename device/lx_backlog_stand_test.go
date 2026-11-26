@@ -168,8 +168,8 @@ func (b *standBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 func (b *standBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	fns, actual, err := b.Bind.Open(port)
 	for i, fn := range fns {
-		fns[i] = func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
-			n, err := fn(packets, sizes, eps)
+		fns[i] = func(slab []byte, packets []conn.ReceivedPacket) (int, error) {
+			n, err := fn(slab, packets)
 			b.received.Add(int64(n))
 			return n, err
 		}

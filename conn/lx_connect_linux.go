@@ -167,9 +167,19 @@ func (s *StdNetBind) pinPort(port int) int {
 // reading for good, while all it says is what a missing reply already says.
 // The read reports no datagrams instead, and the socket is disconnected, so
 // that a peer that stays unreachable does not keep producing them.
-func (s *StdNetBind) connectedReceive(receiveFuncs []ReceiveFunc, v4conn, v6conn *net.UDPConn, port int) []ReceiveFunc {
+//
+// With several sockets per family (upstream's sharding) the first one of each
+// family is the one connected; the others stay as they are.
+func (s *StdNetBind) connectedReceive(receiveFuncs []ReceiveFunc, v4, v6 []*stdNetSocket, port int) []ReceiveFunc {
 	if !s.connect.enabled.Load() {
 		return receiveFuncs
+	}
+	var v4conn, v6conn *net.UDPConn
+	if len(v4) > 0 {
+		v4conn = v4[0].conn
+	}
+	if len(v6) > 0 {
+		v6conn = v6[0].conn
 	}
 	state := &s.connect
 	state.gate.Lock()
@@ -182,8 +192,8 @@ func (s *StdNetBind) connectedReceive(receiveFuncs []ReceiveFunc, v4conn, v6conn
 	}
 
 	wrap := func(receive ReceiveFunc, conn *net.UDPConn, family *connectFamily) ReceiveFunc {
-		return func(bufs [][]byte, sizes []int, endpoints []Endpoint) (int, error) {
-			count, err := receive(bufs, sizes, endpoints)
+		return func(slab []byte, packets []ReceivedPacket) (int, error) {
+			count, err := receive(slab, packets)
 			if err != nil && reportedByICMP(err) {
 				state.abandon(conn, family, "read", err)
 				return 0, nil
@@ -191,13 +201,12 @@ func (s *StdNetBind) connectedReceive(receiveFuncs []ReceiveFunc, v4conn, v6conn
 			return count, err
 		}
 	}
-	next := 0
+	// Open returns every v4 socket's receive function, then every v6 one's
 	if v4conn != nil {
-		receiveFuncs[next] = wrap(receiveFuncs[next], v4conn, &state.v4)
-		next++
+		receiveFuncs[0] = wrap(receiveFuncs[0], v4conn, &state.v4)
 	}
 	if v6conn != nil {
-		receiveFuncs[next] = wrap(receiveFuncs[next], v6conn, &state.v6)
+		receiveFuncs[len(v4)] = wrap(receiveFuncs[len(v4)], v6conn, &state.v6)
 	}
 	return receiveFuncs
 }
@@ -350,10 +359,11 @@ func disconnectSocket(conn *net.UDPConn) {
 // failed for a reason that may lie in the connection. In the second case
 // datagrams that did go out are sent twice, which the receiver's replay
 // window absorbs; that is cheaper than losing the rest.
-func (s *StdNetBind) sendConnected(conn *net.UDPConn, writer batchWriter, is6, offload bool, bufs [][]byte, endpoint *StdNetEndpoint, offset int, msgs []ipv6.Message) (bool, error) {
+func (s *StdNetBind) sendConnected(sock *stdNetSocket, is6, offload bool, bufs [][]byte, endpoint *StdNetEndpoint, offset int, msgs []ipv6.Message) (bool, error) {
 	if !s.connect.enabled.Load() {
 		return false, nil
 	}
+	conn := sock.conn
 	family := s.connect.family(is6)
 	if !s.connect.acquire(conn, family, endpoint.AddrPort) {
 		return false, nil
@@ -367,7 +377,7 @@ func (s *StdNetBind) sendConnected(conn *net.UDPConn, writer batchWriter, is6, o
 	} else {
 		filled = len(bufs)
 		for i := range bufs {
-			setMessageBuffer(&msgs[i], bufs[i][offset:])
+			msgs[i].Buffers[0] = bufs[i][offset:]
 		}
 	}
 	// coalesceMessages stores its *net.UDPAddr, and a nil one is still an
@@ -375,7 +385,7 @@ func (s *StdNetBind) sendConnected(conn *net.UDPConn, writer batchWriter, is6, o
 	for i := 0; i < filled; i++ {
 		msgs[i].Addr = nil
 	}
-	err := s.send(conn, writer, msgs[:filled])
+	err := s.send(sock, msgs[:filled])
 	s.connect.gate.RUnlock()
 	if err == nil {
 		return true, nil

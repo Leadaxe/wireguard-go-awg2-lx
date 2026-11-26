@@ -44,7 +44,7 @@ func TestOpenStillFailsOnEINVAL(t *testing.T) {
 		bind.Close()
 		t.Fatal("Open must fail on EINVAL on non-Windows platforms")
 	}
-	if bind.ipv4 != nil || bind.ipv6 != nil {
+	if len(bind.v4) > 0 || len(bind.v6) > 0 {
 		t.Fatal("failed Open must not leave sockets behind")
 	}
 }

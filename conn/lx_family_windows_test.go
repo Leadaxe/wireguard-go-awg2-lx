@@ -56,10 +56,10 @@ func TestOpenKeepsV4OnWSAEINVAL(t *testing.T) {
 	if len(fns) == 0 {
 		t.Fatal("Open returned no receive funcs")
 	}
-	if bind.ipv4 == nil {
+	if len(bind.v4) == 0 {
 		t.Fatal("v4 socket missing after v6 degradation")
 	}
-	if bind.ipv6 != nil {
+	if len(bind.v6) > 0 {
 		t.Fatal("v6 socket unexpectedly open")
 	}
 	err = bind.Send([][]byte{make([]byte, 32)}, &StdNetEndpoint{AddrPort: netip.MustParseAddrPort("[2001:db8::1]:2000")}, 0)

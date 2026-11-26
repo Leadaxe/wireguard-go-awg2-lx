@@ -26,9 +26,8 @@ type connectedFixture struct {
 	bind     *StdNetBind
 	receive  []ReceiveFunc
 	port     uint16
-	bufs     [][]byte
-	sizes    []int
-	eps      []Endpoint
+	slab     []byte
+	packets  []ReceivedPacket
 	received chan []byte
 	failed   chan error
 	stopped  chan struct{}
@@ -67,12 +66,8 @@ func (f *connectedFixture) open() {
 	}
 	f.receive, f.port = receive, port
 	batch := f.bind.BatchSize()
-	f.bufs = make([][]byte, batch)
-	for i := range f.bufs {
-		f.bufs[i] = make([]byte, 65535)
-	}
-	f.sizes = make([]int, batch)
-	f.eps = make([]Endpoint, batch)
+	f.slab = make([]byte, batch*65535)
+	f.packets = make([]ReceivedPacket, batch)
 	f.received = make(chan []byte, 64)
 	f.failed = make(chan error, 1)
 	stopped := make(chan struct{})
@@ -81,7 +76,7 @@ func (f *connectedFixture) open() {
 	go func() {
 		defer close(stopped)
 		for {
-			n, err := receiveV4(f.bufs, f.sizes, f.eps)
+			n, err := receiveV4(f.slab, f.packets)
 			if err != nil {
 				if !errors.Is(err, net.ErrClosed) {
 					f.failed <- err
@@ -89,8 +84,8 @@ func (f *connectedFixture) open() {
 				return
 			}
 			for i := 0; i < n; i++ {
-				if f.sizes[i] > 0 {
-					f.received <- bytes.Clone(f.bufs[i][:f.sizes[i]])
+				if f.packets[i].Size > 0 {
+					f.received <- bytes.Clone(f.packets[i].Bytes(f.slab))
 				}
 			}
 		}
@@ -113,7 +108,7 @@ func (f *connectedFixture) send(to *net.UDPConn, payloads ...[]byte) {
 
 func (f *connectedFixture) peerName() (netip.AddrPort, bool) {
 	f.t.Helper()
-	rawConn, err := f.bind.ipv4.SyscallConn()
+	rawConn, err := f.bind.v4[0].conn.SyscallConn()
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -137,7 +132,7 @@ func (f *connectedFixture) peerName() (netip.AddrPort, bool) {
 // boundPort asks the kernel, not the address net.UDPConn remembers.
 func (f *connectedFixture) boundPort() int {
 	f.t.Helper()
-	rawConn, err := f.bind.ipv4.SyscallConn()
+	rawConn, err := f.bind.v4[0].conn.SyscallConn()
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -239,7 +234,6 @@ func TestConnectedSocketOffByDefault(t *testing.T) {
 
 func TestConnectedSocketSend(t *testing.T) {
 	f := newConnectedFixture(t, true)
-	sets := trackMessageSets(f.bind)
 	sink := loopbackSink(t)
 
 	single := bytes.Repeat([]byte{1}, 500)
@@ -256,7 +250,6 @@ func TestConnectedSocketSend(t *testing.T) {
 	requireArrives(t, sink, burst...)
 	f.requireConnected(sink)
 	f.stop()
-	requireSetsPristine(t, sets())
 }
 
 // The peer's replies are delivered with its address; a datagram from anyone
@@ -277,7 +270,7 @@ func TestConnectedSocketReceive(t *testing.T) {
 		t.Fatal(err)
 	}
 	requireReceived(t, f, reply)
-	if got := f.eps[0].(*StdNetEndpoint).AddrPort; got != loopbackAddrPort(sink) {
+	if got := f.packets[0].Endpoint.(*StdNetEndpoint).AddrPort; got != loopbackAddrPort(sink) {
 		t.Fatalf("reply is attributed to %v", got)
 	}
 
@@ -420,7 +413,7 @@ func TestConnectedSocketLog(t *testing.T) {
 	f.send(sink, payload)
 	requireArrives(t, sink, payload)
 	take()
-	f.bind.connect.abandon(f.bind.ipv4, &f.bind.connect.v4, "read", unix.ECONNREFUSED)
+	f.bind.connect.abandon(f.bind.v4[0].conn, &f.bind.connect.v4, "read", unix.ECONNREFUSED)
 	requireLines(t, take(), "connected socket: ipv4 disconnected from "+peer+": read: connection refused, retry in 1s")
 
 	f.allowConnect()
@@ -455,7 +448,7 @@ func TestConnectedSocketRetryInterval(t *testing.T) {
 	f.send(sink, payload)
 	requireArrives(t, sink, payload)
 
-	f.bind.connect.abandon(f.bind.ipv4, &f.bind.connect.v4, "send", unix.EHOSTUNREACH)
+	f.bind.connect.abandon(f.bind.v4[0].conn, &f.bind.connect.v4, "send", unix.EHOSTUNREACH)
 	f.requireUnconnected()
 	f.send(sink, payload)
 	requireArrives(t, sink, payload)

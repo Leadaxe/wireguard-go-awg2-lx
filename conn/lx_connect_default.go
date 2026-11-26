@@ -9,7 +9,6 @@
 package conn
 
 import (
-	"net"
 	"net/netip"
 
 	"golang.org/x/net/ipv6"
@@ -34,10 +33,10 @@ func (s *StdNetBind) pinPort(port int) int {
 	return port
 }
 
-func (s *StdNetBind) connectedReceive(receiveFuncs []ReceiveFunc, v4conn, v6conn *net.UDPConn, port int) []ReceiveFunc {
+func (s *StdNetBind) connectedReceive(receiveFuncs []ReceiveFunc, v4, v6 []*stdNetSocket, port int) []ReceiveFunc {
 	return receiveFuncs
 }
 
-func (s *StdNetBind) sendConnected(conn *net.UDPConn, writer batchWriter, is6, offload bool, bufs [][]byte, endpoint *StdNetEndpoint, offset int, msgs []ipv6.Message) (bool, error) {
+func (s *StdNetBind) sendConnected(sock *stdNetSocket, is6, offload bool, bufs [][]byte, endpoint *StdNetEndpoint, offset int, msgs []ipv6.Message) (bool, error) {
 	return false, nil
 }

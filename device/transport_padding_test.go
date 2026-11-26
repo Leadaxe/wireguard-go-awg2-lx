@@ -88,7 +88,7 @@ func (b *chanBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	b.closeSignal = make(chan struct{})
 	closeSignal := b.closeSignal
 	b.mu.Unlock()
-	fn := func(packets [][]byte, sizes []int, eps []conn.Endpoint) (int, error) {
+	fn := func(slab []byte, packets []conn.ReceivedPacket) (int, error) {
 		select {
 		case <-closeSignal:
 			// Must be net.ErrClosed: RoutineReceiveIncoming treats anything
@@ -98,8 +98,7 @@ func (b *chanBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 			if !ok {
 				return 0, net.ErrClosed
 			}
-			sizes[0] = copy(packets[0], pkt)
-			eps[0] = b.target
+			packets[0] = conn.ReceivedPacket{Size: copy(slab, pkt), Endpoint: b.target}
 			return 1, nil
 		}
 	}
@@ -170,7 +169,7 @@ func newChanTun() *chanTun {
 
 func (t *chanTun) File() *os.File { return nil }
 
-func (t *chanTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
+func (t *chanTun) Read(slab []byte, packets []tun.ReadPacket) (int, error) {
 	select {
 	case <-t.closed:
 		return 0, os.ErrClosed
@@ -178,7 +177,7 @@ func (t *chanTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
 		if !ok {
 			return 0, os.ErrClosed
 		}
-		sizes[0] = copy(bufs[0][offset:], pkt)
+		packets[0] = tun.ReadPacket{Offset: tun.ReadPacketSpacing, Size: copy(slab[tun.ReadPacketSpacing:], pkt)}
 		return 1, nil
 	}
 }
