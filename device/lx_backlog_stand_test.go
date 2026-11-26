@@ -58,19 +58,13 @@ func standEnvInt(name string, def int) int {
 
 func standUDP() bool { return os.Getenv("LX_STAND_BIND") == "udp" }
 
-// standUDPBind is a socket bind for the stand. LX_STAND_READ_COUNT sets how
-// many datagrams one read takes (sing-box-lx SPEC 158 part 2);
-// LX_STAND_CONNECT=1 lets it connect its sockets to the peer (SPEC 160).
+// standUDPBind is a socket bind for the stand. LX_STAND_CONNECT=1 lets it
+// connect its sockets to the peer (sing-box-lx SPEC 160).
 func standUDPBind(tb testing.TB) conn.Bind {
 	bind := conn.NewStdNetBind(nil).(*conn.StdNetBind)
 	if os.Getenv("LX_STAND_CONNECT") == "1" {
 		bind.SetSinglePeerMode()
 		bind.SetConnectedSocket()
-	}
-	if count := standEnvInt("LX_STAND_READ_COUNT", 0); count > 0 {
-		if err := bind.SetReadDatagramCount(count); err != nil {
-			tb.Fatal(err)
-		}
 	}
 	return bind
 }

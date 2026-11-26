@@ -65,8 +65,7 @@ type StdNetBind struct {
 
 	msgx msgXState
 
-	readDatagrams atomic.Int32 // lx: SPEC 158 part 2 — see lx_read_count.go; not guarded by mu
-	connect       connectState // lx: SPEC 160 — see lx_connect_linux.go; has its own lock
+	connect connectState // lx: SPEC 160 — see lx_connect_linux.go; has its own lock
 
 	blackhole4 bool
 	blackhole6 bool
@@ -254,7 +253,7 @@ func (s *StdNetBind) bindGroup(network string, port, n int) ([]*net.UDPConn, int
 		if i > 0 {
 			extraControl = []control.Func{reusePortFn}
 		}
-		c, p, err := listenNet(s.listenControl(), network, port, extraControl...) // lx: SPEC 158 part 2 — upstream passes s.externalControl
+		c, p, err := listenNet(s.externalControl, network, port, extraControl...)
 		if err != nil {
 			closeConns(conns)
 			return nil, 0, err
@@ -534,7 +533,7 @@ func (s *StdNetBind) ReceiveNames() []string {
 // rename the IdealBatchSize constant to BatchSize.
 func (s *StdNetBind) BatchSize() int {
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
-		return s.readBatchSize() // lx: SPEC 158 part 2 — IdealBatchSize unless configured
+		return IdealBatchSize
 	}
 	if supportsMsgX {
 		return msgXBatchSize
