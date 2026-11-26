@@ -59,11 +59,11 @@ const (
 )
 
 const (
-	MessageUnknownType     uint32 = 0
-	MessageInitiationType  uint32 = 1
-	MessageResponseType    uint32 = 2
-	MessageCookieReplyType uint32 = 3
-	MessageTransportType   uint32 = 4
+	MessageUnknownType     = 0 // lx: AmneziaWG — no kind matched
+	MessageInitiationType  = 1
+	MessageResponseType    = 2
+	MessageCookieReplyType = 3
+	MessageTransportType   = 4
 )
 
 const (
