@@ -8,9 +8,11 @@ package conn
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -382,6 +384,68 @@ func TestConnectedSocketPeerMoves(t *testing.T) {
 	f.requireConnected(after)
 }
 
+// Every connect and disconnect reaches the log with what caused it, and
+// nothing else does.
+func TestConnectedSocketLog(t *testing.T) {
+	f := newConnectedFixture(t, true)
+	var mu sync.Mutex
+	var lines []string
+	f.bind.SetConnectedSocketLog(func(format string, args ...any) {
+		mu.Lock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	})
+	take := func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		taken := lines
+		lines = nil
+		return taken
+	}
+	sink := loopbackSink(t)
+	peer := loopbackAddrPort(sink).String()
+	payload := bytes.Repeat([]byte{1}, 300)
+
+	f.send(sink, payload)
+	requireArrives(t, sink, payload)
+	f.send(sink, payload)
+	requireArrives(t, sink, payload)
+	requireLines(t, take(), "connected socket: ipv4 connected to "+peer)
+
+	f.bind.ResetPath()
+	f.bind.ResetPath()
+	requireLines(t, take(), "connected socket: ipv4 disconnected from "+peer+": path reset (handshake unanswered or route change), listening to any address for 3s")
+
+	f.allowConnect()
+	f.send(sink, payload)
+	requireArrives(t, sink, payload)
+	take()
+	f.bind.connect.abandon(f.bind.ipv4, &f.bind.connect.v4, "read", unix.ECONNREFUSED)
+	requireLines(t, take(), "connected socket: ipv4 disconnected from "+peer+": read: connection refused, retry in 1s")
+
+	f.allowConnect()
+	f.send(sink, payload)
+	requireArrives(t, sink, payload)
+	take()
+	other := loopbackSink(t)
+	f.send(other, payload)
+	requireArrives(t, other, payload)
+	requireLines(t, take(), "connected socket: ipv4 disconnected from "+peer+": a second destination "+loopbackAddrPort(other).String()+", unconnected until the bind is reopened")
+
+}
+
+func requireLines(t *testing.T, got []string, want ...string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("log lines %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("log line %q, want %q", got[i], want[i])
+		}
+	}
+}
+
 // After the connection was given up the socket stays unconnected for a
 // while, and sends go the ordinary way.
 func TestConnectedSocketRetryInterval(t *testing.T) {
@@ -391,7 +455,7 @@ func TestConnectedSocketRetryInterval(t *testing.T) {
 	f.send(sink, payload)
 	requireArrives(t, sink, payload)
 
-	f.bind.connect.abandon(f.bind.ipv4, &f.bind.connect.v4)
+	f.bind.connect.abandon(f.bind.ipv4, &f.bind.connect.v4, "send", unix.EHOSTUNREACH)
 	f.requireUnconnected()
 	f.send(sink, payload)
 	requireArrives(t, sink, payload)

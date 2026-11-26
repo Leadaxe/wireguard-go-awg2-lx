@@ -200,31 +200,31 @@ func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	// If uport is 0, we can retry on failure.
 again:
 	port := s.pinPort(int(uport)) // lx: SPEC 160 — upstream: int(uport)
-	var v4conn, v6conn *net.UDPConn
 	var v4pc *ipv4.PacketConn
 	var v6pc *ipv6.PacketConn
 
 	// lx: SPEC 069 — a per-family bind failure means "this family is
 	// unavailable here", not "abort the whole bind": keep the sibling socket
-	// instead of failing Open. Upstream only tolerated EAFNOSUPPORT; on
+	// instead of failing Open. Upstream only tolerates EAFNOSUPPORT; on
 	// Windows the external control (interface bind via IPV6_UNICAST_IF)
 	// fails with WSAEINVAL when the default adapter has IPv6 unchecked, and
 	// that error used to close the already-open v4 socket — with BindUpdate
 	// having closed the old bind first, the device was left with no sockets
 	// at all. See bindFamilyUnavailable in lx_family_{default,windows}.go.
-	v4conn, port, err = listenNet(s.listenControl(), "udp4", port) // lx: SPEC 158 part 2 — upstream passes s.externalControl
+	v4conn, v4port, err := listenNet(s.listenControl(), "udp4", port) // lx: SPEC 158 part 2 — upstream passes s.externalControl
 	// lx: SPEC 160 — a port picked by pinPort may have been taken meanwhile
 	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
 		tries++
 		goto again
 	}
-	if err != nil && !bindFamilyUnavailable(err) {
+	if err == nil {
+		port = v4port
+	} else if !bindFamilyUnavailable(err) {
 		return nil, 0, err
 	}
-	v4port := port // lx: SPEC 069 — survives the clobber below
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet(s.listenControl(), "udp6", port) // lx: SPEC 158 part 2 — as above
+	v6conn, v6port, err := listenNet(s.listenControl(), "udp6", port) // lx: SPEC 158 part 2 — as above
 	if uport == 0 && errors.Is(err, syscall.EADDRINUSE) && tries < 100 {
 		if v4conn != nil { // lx: SPEC 069 — v4 may have degraded away above
 			v4conn.Close()
@@ -232,18 +232,13 @@ again:
 		tries++
 		goto again
 	}
-	if err != nil {
-		if !bindFamilyUnavailable(err) {
-			if v4conn != nil { // lx: SPEC 069 — nil-guard, same reason
-				v4conn.Close()
-			}
-			return nil, 0, err
+	if err == nil {
+		port = v6port
+	} else if !bindFamilyUnavailable(err) {
+		if v4conn != nil { // lx: SPEC 069 — nil-guard, same reason
+			v4conn.Close()
 		}
-		// lx: SPEC 069 — the failed v6 listen returned (nil, 0, err) and the
-		// multi-assignment above clobbered the surviving v4 socket's port
-		// with that 0; restore it (latent upstream defect on the
-		// EAFNOSUPPORT degradation path too).
-		port = v4port
+		return nil, 0, err
 	}
 	var fns []ReceiveFunc
 	if v4conn != nil {

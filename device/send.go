@@ -300,12 +300,7 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 
 	sendBuffer = append(sendBuffer, sendBuf)
 
-	if len(candidates) > 0 {
-		err = peer.sendHandshakeBuffers(sendBuffer, candidates)
-	} else {
-		err = peer.SendBuffers(sendBuffer)
-	}
-	err = unwrapGSODisabled(peer.device.log, err) // lx: SPEC 101
+	err = peer.sendHandshakeDatagrams(sendBuffer, candidates) // lx: SPEC 101
 	if err != nil {
 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
 	}
